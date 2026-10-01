@@ -2,9 +2,11 @@
 
 안전장치 (코드로 강제):
 1. 접속 도메인은 모의투자 서버(openapivts.koreainvestment.com)만 허용. 다른 주소면 생성 단계에서 예외.
+   리다이렉트는 따라가지 않는다 (주문 본문·앱키가 다른 호스트로 재전송되지 않게).
 2. 주문 tr_id 는 모의투자용(V로 시작)만 허용.
 3. dry_run=True 이면 주문 요청을 만들어 로그만 남기고 네트워크로 보내지 않는다 (토큰 발급도 하지 않음).
    dry_run 값은 .env 의 DRY_RUN 에서 오며, 명시적으로 false 를 넣기 전에는 항상 True.
+4. 네트워크 오류 메시지에는 URL(쿼리스트링의 계좌번호)을 남기지 않는다.
 
 엔드포인트·tr_id 출처: 한국투자증권 공식 GitHub koreainvestment/open-trading-api (examples_llm, 2026-09-28 커밋 기준).
 """
@@ -39,7 +41,11 @@ class KisError(RuntimeError):
 
 
 class KisApiError(KisError):
-    """KIS 가 오류(rt_cd != 0 또는 HTTP 오류)를 돌려준 경우."""
+    """KIS 가 오류(rt_cd != 0, HTTP 오류, 리다이렉트)를 돌려준 경우. 주문은 접수되지 않은 것."""
+
+
+class KisNetworkError(KisError):
+    """타임아웃·연결 끊김 등. 주문이라면 서버가 접수했는지 알 수 없다."""
 
 
 class OrderBlockedError(KisError):
@@ -81,6 +87,7 @@ class Position:
     qty: int
     avg_price: float
     last_price: float
+    sellable_qty: int | None = None  # 주문가능수량 (매도 주문이 걸려 있으면 줄어듦)
 
 
 @dataclass
@@ -106,6 +113,7 @@ class OrderResult:
     ok: bool
     order_no: str | None = None
     message: str = ""
+    uncertain: bool = False  # 전송했지만 응답을 못 받음 → 접수 여부 불명 (다음 사이클에 잔고로 확인)
     raw: dict[str, Any] | None = field(default=None, repr=False)
 
 
@@ -145,6 +153,20 @@ class KisClient:
             time.sleep(wait)
         self._last_call = time.monotonic()
 
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """모든 HTTP 호출의 단일 통로: 호출 간격, 리다이렉트 차단, 예외 메시지 정리."""
+        self._throttle()
+        try:
+            resp = self._session.request(
+                method, self.base_url + path, allow_redirects=False, timeout=self.timeout_sec, **kwargs
+            )
+        except requests.RequestException as e:
+            # 원래 메시지에는 쿼리스트링(계좌번호)이 포함되므로 경로만 남기고 체인도 끊는다
+            raise KisNetworkError(f"{type(e).__name__} ({method} {path})") from None
+        if 300 <= resp.status_code < 400:
+            raise KisApiError(f"HTTP {resp.status_code} 리다이렉트는 따라가지 않습니다 ({method} {path})")
+        return resp
+
     def _key_fingerprint(self) -> str:
         return hashlib.sha256(self._creds().app_key.encode()).hexdigest()[:16]
 
@@ -166,7 +188,10 @@ class KisClient:
             return
         self.token_cache.parent.mkdir(parents=True, exist_ok=True)
         payload = {"key": self._key_fingerprint(), "token": self._token, "expires_at": self._token_expiry.isoformat()}
-        self.token_cache.write_text(json.dumps(payload), encoding="utf-8")
+        # 처음부터 소유자만 읽을 수 있게 만든 뒤 쓴다
+        fd = os.open(self.token_cache, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload))
         os.chmod(self.token_cache, 0o600)
 
     def access_token(self) -> str:
@@ -176,21 +201,22 @@ class KisClient:
         if self._load_cached_token():
             return self._token  # type: ignore[return-value]
         creds = self._creds()
-        self._throttle()
-        resp = self._session.post(
-            self.base_url + _TOKEN_PATH,
+        resp = self._request(
+            "POST",
+            _TOKEN_PATH,
             data=json.dumps(
                 {"grant_type": "client_credentials", "appkey": creds.app_key, "appsecret": creds.app_secret}
             ),
             headers={"content-type": "application/json; charset=utf-8"},
-            timeout=self.timeout_sec,
         )
         try:
             data = resp.json()
         except ValueError as e:
             raise KisApiError(f"토큰 발급 실패: HTTP {resp.status_code}") from e
         if resp.status_code != 200 or "access_token" not in data:
-            raise KisApiError(f"토큰 발급 실패: HTTP {resp.status_code} {data.get('error_code', '')} {data.get('error_description', '')}")
+            raise KisApiError(
+                f"토큰 발급 실패: HTTP {resp.status_code} {data.get('error_code', '')} {data.get('error_description', '')}"
+            )
         self._token = data["access_token"]
         expired = data.get("access_token_token_expired")
         if expired:
@@ -232,10 +258,7 @@ class KisClient:
 
     def get(self, path: str, tr_id: str, params: dict[str, str]) -> dict[str, Any]:
         """조회(시세·잔고) 전용 GET. 주문이 아니므로 DRY_RUN 과 무관하지만, 자격정보가 있어야 한다."""
-        headers = self._headers(tr_id)
-        self._throttle()
-        resp = self._session.get(self.base_url + path, headers=headers, params=params, timeout=self.timeout_sec)
-        return self._check(resp)
+        return self._check(self._request("GET", path, headers=self._headers(tr_id), params=params))
 
     def submit_order(self, req: OrderRequest) -> OrderResult:
         """주문 전송의 유일한 통로. 여기서 DRY_RUN·tr_id 를 검사한다."""
@@ -246,12 +269,16 @@ class KisClient:
             return OrderResult(req, sent=False, dry_run=True, ok=True, message="DRY_RUN: 전송하지 않음")
 
         # ---- 여기부터만 실제 네트워크 전송 (모의투자 서버) ----
-        headers = self._headers(req.tr_id)
-        self._throttle()
+        headers = self._headers(req.tr_id)  # 토큰 실패는 전송 전이므로 예외로 올려보낸다
         log.info("모의투자 주문 전송: %s", req.describe())
-        resp = self._session.post(
-            self.base_url + req.path, headers=headers, data=json.dumps(req.body), timeout=self.timeout_sec
-        )
+        try:
+            resp = self._request("POST", req.path, headers=headers, data=json.dumps(req.body))
+        except KisNetworkError as e:
+            log.error("주문 응답을 받지 못함 — 접수 여부 불명, 다음 사이클에 잔고로 확인: %s", e)
+            return OrderResult(req, sent=True, dry_run=False, ok=False, uncertain=True, message=str(e))
+        except KisApiError as e:
+            log.error("주문 거부: %s", e)
+            return OrderResult(req, sent=True, dry_run=False, ok=False, message=str(e))
         try:
             data = self._check(resp)
         except KisApiError as e:

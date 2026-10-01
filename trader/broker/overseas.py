@@ -125,7 +125,10 @@ class OverseasBroker:
                 if qty <= 0:
                     continue
                 sym = row.get("ovrs_pdno", "")
-                positions[sym] = Position(sym, qty, to_float(row.get("pchs_avg_pric")), to_float(row.get("now_pric2")))
+                sellable = int(to_float(row.get("ord_psbl_qty"), qty))
+                positions[sym] = Position(
+                    sym, qty, to_float(row.get("pchs_avg_pric")), to_float(row.get("now_pric2")), sellable_qty=sellable
+                )
         # 주문가능 외화금액을 현금으로 본다 (첫 종목·현재가 기준 조회)
         first = self.tickers[0]
         cash = self.buying_power(first, max(self.price(first), 0.01))

@@ -127,7 +127,9 @@ def test_no_signal_no_trade_and_summary_shape(cfg):
     assert res.trades == []
     assert res.equity.iloc[-1] == pytest.approx(cfg.market("kr").initial_capital)
     table, info = summarize(res)
-    assert list(table.columns) == ["종목", "전략수익%", "단순보유%", "거래수", "승률%", "평균손익%", "최대낙폭%(전략)", "최대낙폭%(보유)"]
+    assert list(table.columns) == [
+        "종목", "전략수익%(계좌)", "전략수익%(투입금)", "단순보유%", "거래수", "승률%", "평균손익%", "최대낙폭%(전략)", "최대낙폭%(보유)",
+    ]
     assert table.iloc[-1]["종목"] == "계좌 합계"
     assert info["매매중단"] == "없음"
 
@@ -136,3 +138,13 @@ def test_account_never_spends_more_than_cash(cfg):
     acct = Account(1000.0, cfg.market("kr").costs)
     t = acct.buy("X", 100.0, budget=1e9, when=pd.Timestamp("2025-01-01", tz="UTC"), stop_price_fn=lambda p: p * 0.99)
     assert t.qty == 9 and acct.cash >= 0
+
+
+def test_per_symbol_strategy_and_buy_hold_use_the_same_base(cfg):
+    """평평한 가격에서 한 번 사고판 전략(투입금 기준)과 단순보유는 둘 다 왕복비용만큼 손실이어야 한다."""
+    df = flat_days(1)
+    res = run(cfg, df, [0.9] + [0.0] * 6, strategy={"flatten_at_session_end": False})
+    table, _ = summarize(res)
+    row = table.iloc[0]
+    assert row["전략수익%(투입금)"] == pytest.approx(row["단순보유%"], abs=1e-9)
+    assert row["전략수익%(계좌)"] == pytest.approx(row["전략수익%(투입금)"] * 0.2, rel=0.01)  # 계좌의 20%만 투입

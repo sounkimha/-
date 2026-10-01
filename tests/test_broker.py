@@ -4,8 +4,9 @@ import stat
 from dataclasses import replace
 
 import pytest
+import requests
 
-from trader.broker import VTS_BASE_URL, KisClient, OrderBlockedError, make_broker
+from trader.broker import VTS_BASE_URL, KisApiError, KisClient, KisNetworkError, OrderBlockedError, make_broker
 from trader.broker.domestic import DomesticBroker, krx_tick_size, round_to_tick, to_krx_code
 from trader.broker.overseas import OverseasBroker, us_limit_price
 from trader.config import ConfigError, KisCredentials, is_dry_run, load_credentials
@@ -14,10 +15,10 @@ CREDS = KisCredentials(app_key="APPKEY-XYZ-123", app_secret="APPSECRET-XYZ-456",
 
 
 class NoNetwork:
-    def post(self, *a, **k):
+    def request(self, *a, **k):
         raise AssertionError("네트워크 호출이 일어나면 안 됩니다")
 
-    get = post
+    post = get = request
 
 
 class FakeResp:
@@ -29,16 +30,17 @@ class FakeResp:
 
 
 class Recorder:
+    """응답(또는 던질 예외)을 순서대로 돌려주는 가짜 세션."""
+
     def __init__(self, responses):
         self.calls, self.responses = [], list(responses)
 
-    def post(self, url, **kw):
-        self.calls.append(("POST", url, kw))
-        return self.responses.pop(0)
-
-    def get(self, url, **kw):
-        self.calls.append(("GET", url, kw))
-        return self.responses.pop(0)
+    def request(self, method, url, **kw):
+        self.calls.append((method, url, kw))
+        item = self.responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 # --- DRY_RUN / 자격정보 ------------------------------------------------------
@@ -173,3 +175,32 @@ def test_send_path_targets_paper_server_with_paper_tr_id(cfg, tmp_path):
     rejected = broker.sell("005930.KS", 1)  # 토큰은 캐시 재사용
     assert rejected.sent and not rejected.ok and "주문가능금액 부족" in rejected.message
     assert len(session.calls) == 3
+
+    assert all(kw["allow_redirects"] is False for _, _, kw in session.calls)  # 리다이렉트는 따라가지 않음
+
+
+TOKEN_OK = FakeResp(200, {"access_token": "T", "access_token_token_expired": "2099-01-01 00:00:00"})
+
+
+def test_network_error_on_order_is_uncertain_and_hides_account(cfg):
+    leak = requests.ReadTimeout("Read timed out: /uapi/...?CANO=12345678&ACNT_PRDT_CD=01")
+    session = Recorder([TOKEN_OK, leak, leak])
+    client = KisClient(CREDS, dry_run=False, session=session, min_interval_sec=0)
+    broker = DomesticBroker(client, cfg.broker, ["005930.KS"])
+    res = broker.buy("005930.KS", 1)
+    assert res.sent and not res.ok and res.uncertain  # 접수 여부 불명 → 다음 사이클에 잔고로 확인
+    assert "12345678" not in res.message
+    with pytest.raises(KisNetworkError) as ei:
+        broker.balance()
+    assert "12345678" not in str(ei.value) and ei.value.__cause__ is None and ei.value.__suppress_context__
+
+
+def test_redirect_is_rejected_not_followed(cfg):
+    session = Recorder([TOKEN_OK, FakeResp(307, {}), FakeResp(302, {})])
+    client = KisClient(CREDS, dry_run=False, session=session, min_interval_sec=0)
+    broker = DomesticBroker(client, cfg.broker, ["005930.KS"])
+    res = broker.buy("005930.KS", 1)
+    assert not res.ok and not res.uncertain and "리다이렉트" in res.message
+    with pytest.raises(KisApiError, match="리다이렉트"):
+        broker.balance()
+    assert len(session.calls) == 3  # 다른 호스트로 재전송 없음

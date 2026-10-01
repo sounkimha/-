@@ -116,7 +116,10 @@ class DomesticBroker:
                 continue
             code = row.get("pdno", "")
             symbol = self._code_to_ticker.get(code, code)
-            positions[symbol] = Position(symbol, qty, to_float(row.get("pchs_avg_pric")), to_float(row.get("prpr")))
+            sellable = int(to_float(row.get("ord_psbl_qty"), qty))
+            positions[symbol] = Position(
+                symbol, qty, to_float(row.get("pchs_avg_pric")), to_float(row.get("prpr")), sellable_qty=sellable
+            )
         out2 = data.get("output2")
         summary = out2[0] if isinstance(out2, list) and out2 else (out2 if isinstance(out2, dict) else {})
         # 가수도정산금액(D+2 예수금)을 주문 가능 현금의 근사치로 사용, 없으면 예수금총금액

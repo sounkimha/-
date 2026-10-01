@@ -311,6 +311,11 @@ def _trade_stats(trades: list[Trade]) -> tuple[int, float, float]:
     return len(trades), float((rets > 0).mean() * 100), float(rets.mean() * 100)
 
 
+def compounded_return(trades: list[Trade]) -> float:
+    """투입금 기준 수익률: 매 거래에 같은 돈(배정액 전부)을 넣었다고 보고 거래 수익률을 복리로 곱한 값."""
+    return float(np.prod([1 + t.ret for t in trades]) - 1) if trades else 0.0
+
+
 def equal_weight_buy_hold(result: BacktestResult) -> pd.Series:
     curves = pd.concat(result.buy_hold, axis=1).sort_index()
     return curves.ffill().fillna(1.0).mean(axis=1)
@@ -326,7 +331,8 @@ def summarize(result: BacktestResult) -> tuple[pd.DataFrame, dict[str, Any]]:
         rows.append(
             {
                 "종목": result.market.label(s),
-                "전략수익%": result.symbol_pnl[s].iloc[-1] / init * 100,
+                "전략수익%(계좌)": result.symbol_pnl[s].iloc[-1] / init * 100,
+                "전략수익%(투입금)": compounded_return(trades) * 100,
                 "단순보유%": (bh.iloc[-1] - 1) * 100,
                 "거래수": n,
                 "승률%": win,
@@ -340,7 +346,8 @@ def summarize(result: BacktestResult) -> tuple[pd.DataFrame, dict[str, Any]]:
     rows.append(
         {
             "종목": "계좌 합계",
-            "전략수익%": (result.equity.iloc[-1] / init - 1) * 100,
+            "전략수익%(계좌)": (result.equity.iloc[-1] / init - 1) * 100,
+            "전략수익%(투입금)": float("nan"),
             "단순보유%": (ew.iloc[-1] - 1) * 100,
             "거래수": n,
             "승률%": win,

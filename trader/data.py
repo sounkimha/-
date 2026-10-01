@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time as _time
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -26,13 +26,31 @@ def _utcnow() -> pd.Timestamp:  # 테스트에서 시각을 바꿔 끼우기 위
 
 # --------------------------------------------------------------------------
 # 장 시간 (공휴일·조기폐장은 반영하지 않음: 주말만 건너뜀)
+# 날짜+현지 시각으로 직접 만들어 서머타임 전환일에도 어긋나지 않게 한다.
 # --------------------------------------------------------------------------
-def _at(day: pd.Timestamp, hhmm) -> pd.Timestamp:
-    return day.normalize() + pd.Timedelta(hours=hhmm.hour, minutes=hhmm.minute)
+def _local_date(ts: pd.Timestamp | date, market: MarketConfig) -> date:
+    if isinstance(ts, pd.Timestamp):
+        ts = ts.tz_localize(market.timezone) if ts.tzinfo is None else ts.tz_convert(market.timezone)
+        return ts.date()
+    return ts
+
+
+def _at(day: pd.Timestamp | date, hhmm: time, market: MarketConfig) -> pd.Timestamp:
+    return pd.Timestamp(datetime.combine(_local_date(day, market), hhmm)).tz_localize(market.timezone)
 
 
 def session_close(ts: pd.Timestamp, market: MarketConfig) -> pd.Timestamp:
-    return _at(ts, market.session.close)
+    return _at(ts, market.session.close, market)
+
+
+def session_bar_starts(day: pd.Timestamp | date, market: MarketConfig, interval: str = "1h") -> list[pd.Timestamp]:
+    """그날 정규장 봉들의 시작 시각 (시가 시각부터 interval 간격)."""
+    t, close, step = _at(day, market.session.open, market), _at(day, market.session.close, market), pd.Timedelta(interval)
+    starts = []
+    while t < close:
+        starts.append(t)
+        t += step
+    return starts
 
 
 def bar_end(ts: pd.Timestamp, market: MarketConfig, interval: str = "1h") -> pd.Timestamp:
@@ -51,17 +69,38 @@ def next_bar_start(ts: pd.Timestamp, market: MarketConfig, interval: str = "1h")
     nxt = ts + pd.Timedelta(interval)
     if nxt < session_close(ts, market):
         return nxt
-    day = ts.normalize() + timedelta(days=1)
+    day = _local_date(ts, market) + timedelta(days=1)
     while day.weekday() >= 5:
         day += timedelta(days=1)
-    return _at(day, market.session.open)
+    return _at(day, market.session.open, market)
 
 
 def is_market_open(now: pd.Timestamp, market: MarketConfig) -> bool:
     now = now.tz_convert(market.timezone)
     if now.weekday() >= 5:
         return False
-    return _at(now, market.session.open) <= now < _at(now, market.session.close)
+    return _at(now, market.session.open, market) <= now < _at(now, market.session.close, market)
+
+
+def in_last_bar(now: pd.Timestamp, market: MarketConfig, interval: str = "1h") -> bool:
+    """시계 기준: 지금이 그날 마지막 봉 구간(마지막 봉 시작 ~ 장 마감)인지. 데이터가 늦어도 판단 가능."""
+    now = now.tz_convert(market.timezone)
+    starts = session_bar_starts(now, market, interval) if now.weekday() < 5 else []
+    return bool(starts) and starts[-1] <= now < session_close(now, market)
+
+
+def expected_latest_bar(now: pd.Timestamp, market: MarketConfig, interval: str = "1h") -> pd.Timestamp | None:
+    """지금 시각(데이터 지연 포함)이면 이미 완성돼 있어야 할 가장 최근 봉의 시작 시각."""
+    now = now.tz_convert(market.timezone)
+    delay = pd.Timedelta(minutes=market.data_delay_minutes)
+    day = now.date()
+    for _ in range(14):
+        if day.weekday() < 5:
+            for start in reversed(session_bar_starts(day, market, interval)):
+                if bar_end(start, market, interval) + delay <= now:
+                    return start
+        day -= timedelta(days=1)
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -168,20 +207,25 @@ def load_symbol(
 
     캐시에는 '받은 시점에 이미 끝난 봉'만 저장한다. 덜 끝난 봉이 캐시에 남았다가
     나중에 완성 봉으로 취급되는 일을 막기 위해서다.
+    반환 DataFrame 의 attrs["last_price"] 는 진행 중인 봉까지 포함한 가장 최근 가격(DRY_RUN 체결가용).
     """
     path = _cache_path(cache_dir, ticker, data_cfg.interval)
     fresh = path.exists() and (_time.time() - path.stat().st_mtime) < data_cfg.cache_max_age_minutes * 60
+    latest_raw = None
     if offline or (fresh and not refresh):
         if not path.exists():
             raise DataError(f"{ticker}: 오프라인 모드인데 캐시가 없습니다 ({path}). 먼저 fetch 를 실행하세요")
         df = _read_cache(path, market.timezone)
     else:
-        df = clean_ohlcv(download_ohlcv(ticker, data_cfg.interval, data_cfg.period_days), market.timezone)
-        df = drop_incomplete_last_bar(filter_session(df, market), market, data_cfg.interval)  # 받은 시점 기준
+        raw = filter_session(clean_ohlcv(download_ohlcv(ticker, data_cfg.interval, data_cfg.period_days), market.timezone), market)
+        if not raw.empty:
+            latest_raw = (float(raw["close"].iloc[-1]), raw.index[-1])
+        df = drop_incomplete_last_bar(raw, market, data_cfg.interval)  # 받은 시점 기준
         _write_cache(df, path)
     df = drop_incomplete_last_bar(filter_session(df, market), market, data_cfg.interval, now)
     if df.empty:
         raise DataError(f"{ticker}: 사용할 수 있는 봉이 없습니다")
+    df.attrs["last_price"], df.attrs["last_price_time"] = latest_raw or (float(df["close"].iloc[-1]), df.index[-1])
     return df
 
 

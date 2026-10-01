@@ -110,12 +110,13 @@ def cmd_backtest(cfg, args) -> int:
             f"임계값 이상 신호 {ev['signals']}건, 그중 실제 상승 {ev['precision']:.1%} (n={ev['n']})"
         )
         total = bt.table.iloc[-1]
-        verdict = "높습니다" if total["전략수익%"] > total["단순보유%"] else "낮습니다"
+        verdict = "높습니다" if total["전략수익%(계좌)"] > total["단순보유%"] else "낮습니다"
         per = bt.table.iloc[:-1]
-        worse = int((per["전략수익%"] < per["단순보유%"]).sum())
+        worse = int((per["전략수익%(투입금)"] < per["단순보유%"]).sum())
         print(
-            f"판정: 계좌 전략수익 {total['전략수익%']:+.2f}% vs 동일가중 단순보유 {total['단순보유%']:+.2f}% → 전략이 단순보유보다 {verdict}."
-            f" (종목별로는 {len(per)}개 중 {worse}개에서 전략 < 단순보유)"
+            f"판정: 계좌 전략수익 {total['전략수익%(계좌)']:+.2f}% vs 동일가중 단순보유 {total['단순보유%']:+.2f}% → 전략이 단순보유보다 {verdict}"
+            f" (평균 투입비중 {info['평균투입비중%']:.1f}%)."
+            f" 종목별 투입금 기준으로는 {len(per)}개 중 {worse}개에서 전략 < 단순보유."
         )
 
         reports.mkdir(parents=True, exist_ok=True)
