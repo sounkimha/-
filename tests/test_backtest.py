@@ -10,10 +10,10 @@ from trader.config import CostConfig
 
 
 def flat_days(n_days=2, price=100.0, start="2025-03-03", tz="Asia/Seoul"):
-    """KR 시간표(09:00~15:00, 하루 7봉)로 가격이 평평한 봉."""
+    """국장 야후 시간표(09:00~14:00, 하루 6봉)로 가격이 평평한 봉."""
     idx = []
     for day in pd.bdate_range(start, periods=n_days):
-        for k in range(7):
+        for k in range(6):
             idx.append(pd.Timestamp(day.date()).tz_localize(tz) + pd.Timedelta(hours=9 + k))
     df = pd.DataFrame(price, index=pd.DatetimeIndex(idx, name="time"), columns=["open", "high", "low", "close"])
     df["volume"] = 1000.0
@@ -35,7 +35,7 @@ def expected_flat_return(c: CostConfig) -> float:
 
 def test_round_trip_cost_is_charged(cfg):
     df = flat_days(1)
-    prob = [0.9] + [0.0] * 6  # 0번 봉 신호 → 1번 봉 시가 진입 → 2번 봉 시가 청산
+    prob = [0.9] + [0.0] * 5  # 0번 봉 신호 → 1번 봉 시가 진입 → 2번 봉 시가 청산
     res = run(cfg, df, prob, strategy={"flatten_at_session_end": False})
     assert len(res.trades) == 1
     t = res.trades[0]
@@ -47,7 +47,7 @@ def test_round_trip_cost_is_charged(cfg):
 
 def test_position_size_is_20_percent_of_equity(cfg):
     df = flat_days(1)
-    res = run(cfg, df, [0.9] + [0.0] * 6, strategy={"flatten_at_session_end": False})
+    res = run(cfg, df, [0.9] + [0.0] * 5, strategy={"flatten_at_session_end": False})
     t = res.trades[0]
     init = cfg.market("kr").initial_capital
     assert t.cost_basis <= init * 0.20  # 체결금액 + 수수료가 계좌의 20% 이내
@@ -57,7 +57,7 @@ def test_position_size_is_20_percent_of_equity(cfg):
 def test_intrabar_stop_fills_at_stop_price(cfg):
     df = flat_days(1)
     df.iloc[1] = [100.0, 100.5, 98.0, 99.5, 1000.0]  # 진입 봉에서 저가가 손절가(-1%) 아래로
-    res = run(cfg, df, [0.9] * 7, strategy={"flatten_at_session_end": False})
+    res = run(cfg, df, [0.9] * 6, strategy={"flatten_at_session_end": False})
     t = res.trades[0]
     s = cfg.market("kr").costs.slippage
     assert t.exit_reason == "stop" and t.exit_time == df.index[1]
@@ -67,11 +67,11 @@ def test_intrabar_stop_fills_at_stop_price(cfg):
 
 def test_gap_down_through_stop_loses_more_than_stop(cfg):
     df = flat_days(2)
-    df.iloc[7:, :4] = 95.0  # 다음날 시가가 -5% 갭하락
-    prob = [0.0] * 5 + [0.9, 0.9] + [0.9] * 7  # 14:00 봉 신호 → 15:00 진입 → 오버나이트 보유
+    df.iloc[6:, :4] = 95.0  # 다음날 시가가 -5% 갭하락
+    prob = [0.0] * 4 + [0.9, 0.9] + [0.9] * 6  # 13:00 봉 신호 → 14:00 진입 → 오버나이트 보유
     res = run(cfg, df, prob, strategy={"flatten_at_session_end": False})
     t = res.trades[0]
-    assert t.exit_reason == "gap_stop" and t.exit_time == df.index[7]
+    assert t.exit_reason == "gap_stop" and t.exit_time == df.index[6]
     assert t.exit_price < t.stop_price  # 손절가보다 불리하게 체결
     assert t.ret < -0.049  # 손절 -1% 가 아니라 갭만큼 손실
 
@@ -83,8 +83,8 @@ def test_flatten_at_session_end_never_holds_overnight(cfg):
     for t in res.trades[:-1]:
         assert t.exit_time.date() == t.entry_time.date()
         assert t.exit_reason == "session_end"
-        assert t.exit_time.hour == 15  # 마지막 봉(15:00) 시가에 청산
-    assert not any(t.entry_time.hour == 15 for t in res.trades)  # 마지막 봉 신규 진입 금지
+        assert t.exit_time.hour == 14  # 마지막 봉(14:00) 시가에 청산
+    assert not any(t.entry_time.hour == 14 for t in res.trades)  # 마지막 봉 신규 진입 금지
 
 
 def test_drawdown_limit_halts_all_trading(cfg):
@@ -143,7 +143,7 @@ def test_account_never_spends_more_than_cash(cfg):
 def test_per_symbol_strategy_and_buy_hold_use_the_same_base(cfg):
     """평평한 가격에서 한 번 사고판 전략(투입금 기준)과 단순보유는 둘 다 왕복비용만큼 손실이어야 한다."""
     df = flat_days(1)
-    res = run(cfg, df, [0.9] + [0.0] * 6, strategy={"flatten_at_session_end": False})
+    res = run(cfg, df, [0.9] + [0.0] * 5, strategy={"flatten_at_session_end": False})
     table, _ = summarize(res)
     row = table.iloc[0]
     assert row["전략수익%(투입금)"] == pytest.approx(row["단순보유%"], abs=1e-9)

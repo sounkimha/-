@@ -7,7 +7,9 @@ from trader.data import (
     DataError,
     bar_end,
     drop_incomplete_last_bar,
+    expected_latest_bar,
     filter_session,
+    in_last_bar,
     is_last_bar_start,
     is_market_open,
     load_symbol,
@@ -23,12 +25,16 @@ def ts(s, tz):
 
 def test_bar_timing_kr(cfg):
     kr = cfg.market("kr")
+    # 야후 국장 1시간봉: 09:00~14:00 6봉 (15:00~15:30 없음) → 설정상 마감 15:00
+    assert bar_end(ts("2025-03-04 13:00", KST), kr) == ts("2025-03-04 14:00", KST)
     assert bar_end(ts("2025-03-04 14:00", KST), kr) == ts("2025-03-04 15:00", KST)
-    assert bar_end(ts("2025-03-04 15:00", KST), kr) == ts("2025-03-04 15:30", KST)  # 마지막 봉은 장 마감에 끝남
-    assert is_last_bar_start(ts("2025-03-04 15:00", KST), kr)
-    assert not is_last_bar_start(ts("2025-03-04 14:00", KST), kr)
-    assert next_bar_start(ts("2025-03-04 14:00", KST), kr) == ts("2025-03-04 15:00", KST)
-    assert next_bar_start(ts("2025-03-07 15:00", KST), kr) == ts("2025-03-10 09:00", KST)  # 금 → 월
+    assert is_last_bar_start(ts("2025-03-04 14:00", KST), kr)
+    assert not is_last_bar_start(ts("2025-03-04 13:00", KST), kr)
+    assert next_bar_start(ts("2025-03-04 13:00", KST), kr) == ts("2025-03-04 14:00", KST)
+    assert next_bar_start(ts("2025-03-07 14:00", KST), kr) == ts("2025-03-10 09:00", KST)  # 금 → 월
+    assert in_last_bar(ts("2025-03-04 14:21", KST), kr) and not in_last_bar(ts("2025-03-04 13:59", KST), kr)
+    # 데이터 지연 20분 가정: 09:21 에는 전날 14:00 봉까지가 와 있어야 한다
+    assert expected_latest_bar(ts("2025-03-05 09:21", KST), kr) == ts("2025-03-04 14:00", KST)
 
 
 def test_bar_timing_us_dst(cfg):
@@ -52,9 +58,9 @@ def test_filter_session_drops_out_of_hours_bars(cfg):
 def test_drop_incomplete_last_bar_respects_delay(cfg):
     kr = cfg.market("kr")  # 데이터 지연 20분 가정
     df = make_bars(2, start="2025-03-03")
-    last = df.index[-1]  # 15:00 봉 → 15:30 종료
-    assert len(drop_incomplete_last_bar(df, kr, now=last + pd.Timedelta(minutes=45))) == len(df) - 1
-    assert len(drop_incomplete_last_bar(df, kr, now=last + pd.Timedelta(minutes=51))) == len(df)
+    last = df.index[-1]  # 14:00 봉 → 15:00 종료 + 지연 20분 = 15:20 에 완성
+    assert len(drop_incomplete_last_bar(df, kr, now=last + pd.Timedelta(minutes=79))) == len(df) - 1
+    assert len(drop_incomplete_last_bar(df, kr, now=last + pd.Timedelta(minutes=81))) == len(df)
 
 
 def test_download_failure_raises_without_fallback(cfg, tmp_path, monkeypatch):

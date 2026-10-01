@@ -25,7 +25,7 @@ def setup(cfg, tmp_path, monkeypatch):
     c = replace(cfg, paths=replace(cfg.paths, state_dir=str(tmp_path / "state")))
     tickers = list(c.market("kr").symbols)
     ctx = {
-        "bars": {t: make_bars(30, seed=i, start="2025-02-03") for i, t in enumerate(tickers)},  # 마지막 봉 03-14 15:00
+        "bars": {t: make_bars(30, seed=i, start="2025-02-03") for i, t in enumerate(tickers)},  # 마지막 봉 03-14 14:00
         "errors": {},
         "prob": 0.9,
     }

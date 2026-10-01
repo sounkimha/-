@@ -19,13 +19,15 @@ def make_bars(
     *,
     tz: str = "Asia/Seoul",
     first_bar: str = "09:00",
-    bars_per_day: int = 7,
+    bars_per_day: int | None = None,
     start: str = "2025-01-06",
     seed: int = 0,
     vol: float = 0.005,
     price: float = 100.0,
 ) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
+    if bars_per_day is None:  # 야후 실제 구조: 국장 09:00~14:00 6봉, 미장 09:30~15:30 7봉
+        bars_per_day = 7 if first_bar == "09:30" else 6
     hh, mm = (int(x) for x in first_bar.split(":"))
     rows, idx = [], []
     for day in pd.bdate_range(start, periods=n_days):

@@ -51,7 +51,7 @@ def test_rsi_bounds_and_constant_series():
 def test_make_dataset_long_format(cfg):
     bars = {"A": make_bars(10, seed=1), "B": make_bars(10, seed=2)}
     ds = make_dataset(bars, cfg.features, 0.001)
-    assert len(ds) == 140
+    assert len(ds) == 120
     assert ds["time"].is_monotonic_increasing
     assert set(ds["symbol"]) == {"A", "B"}
     cols = feature_columns(ds)

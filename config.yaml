@@ -12,9 +12,9 @@ markets:
     timezone: Asia/Seoul
     initial_capital: 10000000        # 백테스트 / DRY_RUN 가상계좌 시작 금액(원)
     data_delay_minutes: 20           # (추정) 야후 KRX 시세 지연. 완성되지 않은 봉을 버리는 데 사용
-    session:
-      open: "09:00"
-      close: "15:30"
+    session:                         # 실제 장 마감은 15:30 이지만, 야후 1시간봉은 14:00봉(~15:00)이 마지막이고
+      open: "09:00"                  # 15:00~15:30(종가 동시호가 포함) 구간이 없다 → 데이터 기준으로 15:00 마감 취급.
+      close: "15:00"                 # 이 시스템은 15:00 이후 국장 주문을 내지 않는다.
     symbols:                         # yfinance 티커: 표시 이름
       "005930.KS": 삼성전자
       "000660.KS": SK하이닉스
