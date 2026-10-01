@@ -53,8 +53,14 @@ def session_bar_starts(day: pd.Timestamp | date, market: MarketConfig, interval:
     return starts
 
 
+def is_daily(interval: str) -> bool:
+    return interval.endswith("d")
+
+
 def bar_end(ts: pd.Timestamp, market: MarketConfig, interval: str = "1h") -> pd.Timestamp:
-    """봉이 끝나는 시각. 장 마감에 걸친 봉(예: 미장 15:30 봉)은 장 마감 시각에 끝난다."""
+    """봉이 끝나는 시각. 장 마감에 걸친 봉(예: 미장 15:30 봉)은 장 마감 시각에 끝난다. 일봉은 그날 장 마감."""
+    if is_daily(interval):
+        return session_close(ts, market)
     end = ts + pd.Timedelta(interval)
     close = session_close(ts, market)
     return min(end, close) if ts < close else end
@@ -154,10 +160,12 @@ def clean_ohlcv(df: pd.DataFrame, tz: str) -> pd.DataFrame:
     return out
 
 
-def filter_session(df: pd.DataFrame, market: MarketConfig) -> pd.DataFrame:
-    """정규장 안에서 시작한 봉만 남긴다 (시간외·장 마감 시각에 찍힌 봉 제거, 주말 제거)."""
+def filter_session(df: pd.DataFrame, market: MarketConfig, interval: str = "1h") -> pd.DataFrame:
+    """정규장 안에서 시작한 봉만 남긴다 (시간외·장 마감 시각에 찍힌 봉 제거, 주말 제거). 일봉은 주말만 제거."""
     if df.empty:
         return df
+    if is_daily(interval):
+        return df[df.index.weekday < 5]
     minutes = df.index.hour * 60 + df.index.minute
     o, c = market.session.open, market.session.close
     keep = (minutes >= o.hour * 60 + o.minute) & (minutes < c.hour * 60 + c.minute) & (df.index.weekday < 5)
@@ -217,12 +225,16 @@ def load_symbol(
             raise DataError(f"{ticker}: 오프라인 모드인데 캐시가 없습니다 ({path}). 먼저 fetch 를 실행하세요")
         df = _read_cache(path, market.timezone)
     else:
-        raw = filter_session(clean_ohlcv(download_ohlcv(ticker, data_cfg.interval, data_cfg.period_days), market.timezone), market)
+        raw = filter_session(
+            clean_ohlcv(download_ohlcv(ticker, data_cfg.interval, data_cfg.period_days), market.timezone),
+            market,
+            data_cfg.interval,
+        )
         if not raw.empty:
             latest_raw = (float(raw["close"].iloc[-1]), raw.index[-1])
         df = drop_incomplete_last_bar(raw, market, data_cfg.interval)  # 받은 시점 기준
         _write_cache(df, path)
-    df = drop_incomplete_last_bar(filter_session(df, market), market, data_cfg.interval, now)
+    df = drop_incomplete_last_bar(filter_session(df, market, data_cfg.interval), market, data_cfg.interval, now)
     if df.empty:
         raise DataError(f"{ticker}: 사용할 수 있는 봉이 없습니다")
     df.attrs["last_price"], df.attrs["last_price_time"] = latest_raw or (float(df["close"].iloc[-1]), df.index[-1])

@@ -1,0 +1,66 @@
+# =====================================================================
+#  국내 ETF 일봉 · 시가 주문 · 소액(100만원) 프로필 — 학습용 추세 돌파 규칙
+#    python main.py --config config.daily.yaml backtest
+#    python main.py --config config.daily.yaml signal --held 069500.KS
+#
+#  왜 이 구성인가 (자세한 근거는 README "일봉 ETF 프로필")
+#  - 1시간봉 ML 단타는 실데이터 백테스트에서 비용을 못 넘었다 → 거래 횟수가 적은 일봉 추세 추종으로 전환
+#  - 개별주 대신 국내 주식형 ETF: 매도 거래세 0, 한 종목 리스크 분산
+#  - 주문은 다음 거래일 시가(08:30~09:00 동시호가). 신호는 전날 종가로만 계산 → 장중에 화면을 볼 필요 없음
+#  - 아래 파라미터는 결과를 보기 전에 정했다. 백테스트를 보고 숫자를 고치면 과최적화가 된다.
+# =====================================================================
+
+markets:
+  kr:
+    name: 국내 ETF(일봉)
+    currency: KRW
+    timezone: Asia/Seoul
+    initial_capital: 1000000         # 100만원
+    data_delay_minutes: 30           # 장 마감(15:30) 후 30분 지나야 그날 일봉을 완성 봉으로 본다
+    session:
+      open: "09:00"
+      close: "15:30"
+    symbols:                         # 시장 대표 2 + 업종 7. 업종 선정은 '지금' 한 것이라 생존·선택 편향이 있다
+      "069500.KS": KODEX 200
+      "229200.KS": KODEX 코스닥150
+      "091160.KS": KODEX 반도체
+      "091170.KS": KODEX 은행
+      "091180.KS": KODEX 자동차
+      "102970.KS": KODEX 증권
+      "305720.KS": KODEX 2차전지산업
+      "117700.KS": KODEX 건설
+      "244580.KS": KODEX 바이오
+    costs:                           # 단위: %
+      commission_pct: 0.015          # (가정) 편도 수수료. 실제 미래에셋 수수료는 계좌 유형마다 다르니 확인 후 수정
+      sell_tax_pct: 0.0              # 국내 주식형 ETF 는 매도 거래세 없음
+      slippage_pct: 0.02             # 편도. 시가 단일가 체결이라 호가 스프레드는 거의 없지만 여유분
+      # 왕복 = 0.015*2 + 0 + 0.02*2 = 0.07%
+
+data:
+  interval: 1d
+  period_days: 3650                  # 최근 10년. 200일선 준비 기간 때문에 실제 매매는 약 9년
+  cache_dir: data_cache
+  cache_max_age_minutes: 60
+
+strategy:
+  type: rule_breakout
+  long_ma: 200                       # 추세 필터: 종가 > 200일선
+  breakout_lookback: 20              # 진입: 종가 > 직전 20거래일 최고 종가(당일 제외)
+  exit_ma: 20                        # 청산: 종가 < 20일선 → 다음 날 시가 매도
+  score_lookback: 20                 # 후보가 빈자리보다 많으면 최근 20일 수익률 높은 순
+  entry_limit_pct: 2.0               # 매수는 지정가 = 신호일 종가 × 1.02. 시가가 더 높으면(갭 상승) 미체결 → 취소
+  max_positions: 3                   # 동시 보유 최대 3종목
+  reentry_cooldown_bars: 5           # 청산 후 5거래일은 같은 종목 재진입 금지 (휩소 완화)
+  flatten_at_session_end: false      # 일봉은 며칠~몇 주 보유 (장마감 청산 없음)
+
+risk:
+  stop_loss_pct: 8.0                 # 종가가 매수가 대비 -8% 이하 → 다음 날 시가 매도 (갭이면 더 잃음)
+  stop_check: close                  # 장중 저가가 아니라 '종가'로 판단 (장중에 화면을 안 봐도 되게)
+  position_size_pct: 33.0            # 1종목 = 평가금액의 33%. 100만원이면 약 33만원
+  max_drawdown_pct: 10.0             # 계좌 고점 대비 -10% → 전부 매도하고 매매 중단 (재개는 사람이 판단)
+  liquidate_on_halt: true
+  max_trades_per_day: 3
+
+paths:
+  state_dir: state
+  reports_dir: reports

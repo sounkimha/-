@@ -4,6 +4,10 @@
 - t 봉 종가에서 계산한 신호 → t+1 봉 '시가'에 체결. 매수가는 시가×(1+슬리피지), 매도가는 ×(1-슬리피지).
 - 손절: 보유 중인 봉의 시가가 이미 손절가 아래(갭하락)면 그 시가에 청산 → 손절가보다 더 크게 손실.
         그렇지 않고 저가가 손절가에 닿으면 손절가에 청산. 진입한 봉에서도 손절될 수 있다.
+        stop_check=close 면 봉 중에는 보지 않고, 종가가 손절가 이하일 때 다음 봉 시가에 청산(갭이면 더 손실).
+- 지정가 매수(entry_limit_pct>0): 지정가 = 신호 봉 종가×(1+N%). 다음 봉 시가가 그보다 높으면 미체결(당일 취소).
+- 같은 시가에서는 매도 → 매수 순서로 체결해 매도 대금을 바로 쓴다. 실제 시가 동시호가에서는 매도가 체결되기 전이라
+  그 대금이 주문가능금액에 안 잡히므로, 실전에서는 '매도 체결 직후 매수'로 근사된다.
 - 장 마감 청산(flatten_at_session_end): 다음 봉이 그날 마지막 봉이면 그 시가에 청산하고, 마지막 봉 신규 진입은 막는다.
 - 비용: 편도 수수료(매수·매도), 매도세, 편도 슬리피지.
 - 손실 제한(1회 투입 비율·손절·계좌 최대낙폭 중단·일일 진입 횟수)은 risk.RiskManager 가 판단한다.
@@ -11,7 +15,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import reduce
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -147,6 +151,11 @@ class BacktestResult:
     halted_at: pd.Timestamp | None = None
     halt_reason: str | None = None
     symbols: list[str] = field(default_factory=list)
+    unfilled_entries: int = 0  # 지정가보다 높게 시작해 체결되지 않은 매수 주문 수
+
+
+def _column(sig: pd.DataFrame, name: str, dtype=float):
+    return sig[name].to_numpy(dtype) if name in sig.columns else None
 
 
 def _prepare(bars, signals, start) -> dict[str, SimpleNamespace]:
@@ -160,6 +169,7 @@ def _prepare(bars, signals, start) -> dict[str, SimpleNamespace]:
             continue
         sig = signals[s].reindex(df.index)
         day = df.index.normalize()
+        nan = np.full(len(df), np.nan)
         data[s] = SimpleNamespace(
             df=df,
             time=df.index,
@@ -167,12 +177,28 @@ def _prepare(bars, signals, start) -> dict[str, SimpleNamespace]:
             h=df["high"].to_numpy(float),
             l=df["low"].to_numpy(float),
             c=df["close"].to_numpy(float),
-            prob=sig["prob"].to_numpy(float),
-            er=sig["exp_ret"].to_numpy(float),
+            prob=_column(sig, "prob") if "prob" in sig.columns else nan,
+            er=_column(sig, "exp_ret") if "exp_ret" in sig.columns else nan,
+            # 규칙 전략용(있으면 prob 대신 사용): entry/hold 는 NaN 이면 False
+            entry=None if "entry" not in sig.columns else sig["entry"].fillna(False).to_numpy(bool),
+            hold=None if "hold" not in sig.columns else sig["hold"].fillna(False).to_numpy(bool),
+            score=_column(sig, "score"),
             is_last=np.r_[np.asarray(day[1:] != day[:-1]), True],
             n=len(df),
         )
     return data
+
+
+def _wants_entry(d, i, st: StrategyConfig) -> bool:
+    if d.entry is not None:
+        return bool(d.entry[i])
+    return bool(d.prob[i] >= st.entry_threshold and d.er[i] >= st.min_expected_return)
+
+
+def _wants_hold(d, i, st: StrategyConfig) -> bool:
+    if d.hold is not None:
+        return bool(d.hold[i])
+    return bool(d.prob[i] >= st.exit_threshold)  # NaN 이면 False → 청산
 
 
 def buy_hold_curve(df: pd.DataFrame, costs: CostConfig) -> pd.Series:
@@ -189,7 +215,11 @@ def run_backtest(
     risk_cfg: RiskConfig,
     start: pd.Timestamp | None = None,
 ) -> BacktestResult:
-    """signals[종목] = DataFrame(index=봉 시작시각, columns=[prob, exp_ret]) — 각 봉 종가 시점에 계산된 값."""
+    """signals[종목] = 봉 종가 시점에 계산된 값.
+
+    - ML: columns=[prob, exp_ret] → strategy 임계값으로 진입/청산
+    - 규칙: columns=[entry, hold, score] → entry 면 진입 후보, hold 가 False 면 청산, score 높은 순으로 빈자리 채움
+    """
     data = _prepare(bars, signals, start)
     if not data:
         raise ValueError("백테스트할 데이터가 없습니다")
@@ -198,39 +228,56 @@ def run_backtest(
 
     acct = Account(market.initial_capital, market.costs)
     rm = RiskManager(risk_cfg, market.initial_capital)
-    pending: dict[str, tuple[str, str, float]] = {}  # 종목 -> (buy|sell, 사유, 매수예산)
+    pending: dict[str, tuple[str, str, float, float | None]] = {}  # 종목 -> (buy|sell, 사유, 매수예산, 지정가)
     ptr = dict.fromkeys(syms, 0)
     last_close: dict[str, float] = {}
+    last_exit: dict[str, int] = {}  # 종목 -> 마지막 청산 봉 번호 (재진입 대기용)
     realized = dict.fromkeys(syms, 0.0)
     eq, expo, sym_rows = [], [], []
     halted_at = None
+    unfilled = 0
+    intrabar_stop = risk_cfg.stop_check == "intrabar"
+
+    def close_position(s: str, price: float, ts, reason: str) -> None:
+        realized[s] += acct.sell(s, price, ts, reason).pnl
+        last_exit[s] = ptr[s]
 
     for ts in timeline:
         day_key = ts.date().isoformat()
         active = [s for s in syms if ptr[s] < data[s].n and data[s].time[ptr[s]] == ts]
+        active_set = set(active)
 
-        # 1) 이번 봉: 대기 주문 시가 체결 → 손절 확인
+        # 1) 이번 봉 시가: 대기 매도 → 대기 매수 순서로 체결 (매도 대금을 같은 시가 매수에 쓸 수 있게)
+        for s in active:
+            order = pending.get(s)
+            if order is not None and order[0] == "sell":
+                del pending[s]
+                if s in acct.positions:
+                    close_position(s, data[s].o[ptr[s]], ts, order[1])
+        for s in [s for s, o in list(pending.items()) if s in active_set and o[0] == "buy"]:
+            _, _, budget, limit = pending.pop(s)
+            d, i = data[s], ptr[s]
+            if s in acct.positions:
+                continue
+            if limit is not None and d.o[i] > limit:  # 지정가보다 높게 시작 → 미체결(당일 취소)
+                unfilled += 1
+                continue
+            ok, _ = rm.can_enter(day_key)
+            if ok and acct.buy(s, d.o[i], budget, ts, rm.stop_price) is not None:
+                rm.record_entry(day_key)
+        # 손절(봉 중 판단 모드): 갭으로 시가가 이미 손절가 아래면 시가, 아니면 저가가 닿을 때 손절가
         for s in active:
             d, i = data[s], ptr[s]
-            o, l, c = d.o[i], d.l[i], d.c[i]
-            order = pending.pop(s, None)
-            if order is not None:
-                side, reason, budget = order
-                if side == "sell" and s in acct.positions:
-                    realized[s] += acct.sell(s, o, ts, reason).pnl
-                elif side == "buy" and s not in acct.positions:
-                    ok, _ = rm.can_enter(day_key)
-                    if ok and acct.buy(s, o, budget, ts, rm.stop_price) is not None:
-                        rm.record_entry(day_key)
+            pos = acct.positions.get(s)
+            if pos is not None and intrabar_stop:
+                if pos.entry_time < ts and d.o[i] <= pos.stop_price:
+                    close_position(s, d.o[i], ts, "gap_stop")
+                elif d.l[i] <= pos.stop_price:
+                    close_position(s, pos.stop_price, ts, "stop")
             pos = acct.positions.get(s)
             if pos is not None:
-                if pos.entry_time < ts and o <= pos.stop_price:
-                    realized[s] += acct.sell(s, o, ts, "gap_stop").pnl
-                elif l <= pos.stop_price:
-                    realized[s] += acct.sell(s, pos.stop_price, ts, "stop").pnl
-                else:
-                    pos.bars_held += 1
-            last_close[s] = c
+                pos.bars_held += 1
+            last_close[s] = d.c[i]
 
         # 2) 종가 기준 평가 → 계좌 최대낙폭 확인
         equity = acct.equity(last_close)
@@ -246,31 +293,49 @@ def run_backtest(
                 del pending[s]
             if risk_cfg.liquidate_on_halt:
                 for s in acct.positions:
-                    pending[s] = ("sell", "halt", 0.0)
+                    pending[s] = ("sell", "halt", 0.0, None)
 
-        # 3) 다음 봉 주문 결정 (이번 봉 종가까지의 정보만 사용)
+        # 3) 다음 봉 주문 결정 (이번 봉 종가까지의 정보만 사용): 청산 먼저, 그다음 진입 후보를 점수 순으로
+        candidates: list[tuple[float, str]] = []
         for s in active:
             d, i = data[s], ptr[s]
-            ptr[s] = i + 1
             if s in pending or i + 1 >= d.n:
                 continue
             next_is_last = bool(d.is_last[i + 1])
-            p, er = d.prob[i], d.er[i]
             pos = acct.positions.get(s)
             if pos is not None:
                 reason = None
-                if strategy.flatten_at_session_end and next_is_last:
+                if not intrabar_stop and d.c[i] <= pos.stop_price:  # 종가 손절 → 다음 시가 청산(갭이면 더 손실)
+                    reason = "stop"
+                elif strategy.flatten_at_session_end and next_is_last:
                     reason = "session_end"
-                elif not p >= strategy.exit_threshold:  # NaN 이어도 청산
+                elif not _wants_hold(d, i, strategy):
                     reason = "signal"
                 elif strategy.max_hold_bars and pos.bars_held >= strategy.max_hold_bars:
                     reason = "max_hold"
                 if reason:
-                    pending[s] = ("sell", reason, 0.0)
+                    pending[s] = ("sell", reason, 0.0, None)
             elif not rm.halted:
                 blocked_last = strategy.flatten_at_session_end and next_is_last
-                if p >= strategy.entry_threshold and er >= strategy.min_expected_return and not blocked_last:
-                    pending[s] = ("buy", "", rm.position_budget(equity))
+                cooling = strategy.reentry_cooldown_bars and s in last_exit and i - last_exit[s] < strategy.reentry_cooldown_bars
+                if not blocked_last and not cooling and _wants_entry(d, i, strategy):
+                    sc = d.score[i] if d.score is not None else 0.0
+                    candidates.append((sc if sc == sc else -np.inf, s))  # NaN 점수는 맨 뒤
+        if candidates:
+            candidates.sort(key=lambda x: -x[0])  # 안정 정렬: 점수가 같으면 기존 순서 유지
+            if strategy.max_positions:
+                n_after = (
+                    len(acct.positions)
+                    - sum(1 for o in pending.values() if o[0] == "sell")
+                    + sum(1 for o in pending.values() if o[0] == "buy")
+                )
+                candidates = candidates[: max(strategy.max_positions - n_after, 0)]
+            for _, s in candidates:
+                d, i = data[s], ptr[s]
+                limit = d.c[i] * (1 + strategy.entry_limit_pct / 100) if strategy.entry_limit_pct > 0 else None
+                pending[s] = ("buy", "", rm.position_budget(equity), limit)
+        for s in active:
+            ptr[s] += 1
 
     # 기간 끝: 남은 포지션은 마지막 종가에 청산 (비용 반영)
     for s in list(acct.positions):
@@ -292,6 +357,7 @@ def run_backtest(
         halted_at=halted_at,
         halt_reason=rm.halt_reason,
         symbols=syms,
+        unfilled_entries=unfilled,
     )
 
 
@@ -319,6 +385,10 @@ def compounded_return(trades: list[Trade]) -> float:
 def equal_weight_buy_hold(result: BacktestResult) -> pd.Series:
     curves = pd.concat(result.buy_hold, axis=1).sort_index()
     return curves.ffill().fillna(1.0).mean(axis=1)
+
+
+def _is_daily_index(idx: pd.DatetimeIndex) -> bool:
+    return bool(len(idx)) and bool(((idx.hour == 0) & (idx.minute == 0)).all())
 
 
 def summarize(result: BacktestResult) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -357,15 +427,106 @@ def summarize(result: BacktestResult) -> tuple[pd.DataFrame, dict[str, Any]]:
         }
     )
     reasons = Counter(EXIT_REASON_KO.get(t.exit_reason, t.exit_reason) for t in result.trades)
+    fmt = "%Y-%m-%d" if _is_daily_index(result.equity.index) else "%Y-%m-%d %H:%M"
     info = {
-        "기간": f"{result.start:%Y-%m-%d %H:%M} ~ {result.end:%Y-%m-%d %H:%M} ({result.market.timezone})",
+        "기간": f"{result.start:{fmt}} ~ {result.end:{fmt}} ({result.market.timezone})",
         "거래일": int(pd.Index(result.equity.index.normalize()).nunique()),
         "왕복비용%": result.market.costs.round_trip * 100,
         "평균투입비중%": float(result.exposure.mean() * 100),
         "청산사유": dict(reasons),
-        "매매중단": f"{result.halted_at} — {result.halt_reason}" if result.halted_at is not None else "없음",
+        "매매중단": f"{result.halted_at:{fmt}} — {result.halt_reason}" if result.halted_at is not None else "없음",
+        "지정가미체결": result.unfilled_entries,
     }
     return pd.DataFrame(rows), info
+
+
+def _period_return(curve: pd.Series, mask: pd.Series, base: float) -> tuple[float, float]:
+    part = curve[mask]
+    start = curve[curve.index < part.index[0]]
+    b = start.iloc[-1] if len(start) else base
+    path = pd.concat([pd.Series([b]), part.reset_index(drop=True)])
+    return float(part.iloc[-1] / b - 1), max_drawdown(path)
+
+
+def _curve_stats(curve: pd.Series, base: float, years: float) -> dict[str, float]:
+    total = curve.iloc[-1] / base
+    daily = pd.concat([pd.Series([base]), curve.reset_index(drop=True)]).pct_change().dropna()
+    sd = daily.std()
+    return {
+        "총수익%": (total - 1) * 100,
+        "연환산%": (total ** (1 / years) - 1) * 100 if years > 0 and total > 0 else float("nan"),
+        "최대낙폭%": max_drawdown(pd.concat([pd.Series([base]), curve])) * 100,
+        "샤프(rf=0)": float(daily.mean() / sd * np.sqrt(252)) if sd > 0 else float("nan"),
+    }
+
+
+def comparison_table(
+    result: BacktestResult, benchmark: str | None = None, extras: dict[str, BacktestResult] | None = None
+) -> pd.DataFrame:
+    """같은 기간의 전략 / (비용 가정을 바꾼) 전략 / 기준 종목 보유 / 동일가중 보유를 한 표로. 일봉 기준 지표."""
+    years = (result.end - result.start).days / 365.25
+    idx = result.equity.index
+    rows = []
+    for name, r in {"전략": result, **(extras or {})}.items():
+        rows.append({"구분": name, **_curve_stats(r.equity, r.initial_capital, years),
+                     "평균투입%": r.exposure.mean() * 100, "거래수": len(r.trades)})
+    if benchmark:
+        bench = result.buy_hold[benchmark].reindex(idx).ffill().fillna(1.0)
+        rows.append({"구분": f"{result.market.label(benchmark)} 보유", **_curve_stats(bench, 1.0, years),
+                     "평균투입%": 100.0, "거래수": float("nan")})
+    ew = equal_weight_buy_hold(result).reindex(idx).ffill().fillna(1.0)
+    rows.append({"구분": f"동일가중 {len(result.symbols)}종목 보유", **_curve_stats(ew, 1.0, years),
+                 "평균투입%": 100.0, "거래수": float("nan")})
+    out = pd.DataFrame(rows)
+    out["거래수"] = out["거래수"].astype("Int64")
+    return out
+
+
+def with_cost_multiplier(cfg: AppConfig, market_key: str, mult: float) -> AppConfig:
+    """수수료·슬리피지만 mult 배로 (세금은 정해진 값이라 그대로). 비용 민감도 점검용."""
+    m = cfg.market(market_key)
+    costs = replace(m.costs, commission_pct=m.costs.commission_pct * mult, slippage_pct=m.costs.slippage_pct * mult)
+    return replace(cfg, markets={**cfg.markets, market_key: replace(m, costs=costs)})
+
+
+def yearly_table(result: BacktestResult, benchmark: str | None = None) -> pd.DataFrame:
+    """연도별: 전략 / 동일가중 단순보유 / 기준 종목 단순보유 수익률과 전략 MDD, 진입 수."""
+    eq = result.equity
+    ew = equal_weight_buy_hold(result).reindex(eq.index).ffill().fillna(1.0)
+    bench = result.buy_hold.get(benchmark) if benchmark else None
+    bench = None if bench is None else bench.reindex(eq.index).ffill().fillna(1.0)
+    rows = []
+    for year in sorted(set(eq.index.year)):
+        m = pd.Series(eq.index.year == year, index=eq.index)
+        r, mdd = _period_return(eq, m, result.initial_capital)
+        row = {"연도": year, "전략%": r * 100, "전략MDD%": mdd * 100, "동일가중보유%": _period_return(ew, m, 1.0)[0] * 100}
+        if bench is not None:
+            row[f"{result.market.label(benchmark)} 보유%"] = _period_return(bench, m, 1.0)[0] * 100
+        row["진입수"] = sum(1 for t in result.trades if t.entry_time.year == year)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def regime_table(result: BacktestResult, bench_bars: pd.DataFrame, benchmark: str, ma: int = 200, slope: int = 20) -> pd.DataFrame:
+    """기준 종목의 200일선과 그 기울기로 국면을 나눠 국면별 연환산 수익률을 비교 (보고용, 매매에는 쓰지 않음)."""
+    c = bench_bars["close"]
+    sma = c.rolling(ma).mean()
+    up = (c > sma) & (sma > sma.shift(slope))
+    down = (c < sma) & (sma < sma.shift(slope))
+    regime = pd.Series("횡보장", index=c.index).mask(up, "상승장").mask(down, "하락장").where(sma.notna())
+    eq = result.equity
+    reg = regime.reindex(eq.index).ffill()
+    strat = eq.pct_change()
+    bh = result.buy_hold[benchmark].reindex(eq.index).ffill().pct_change()
+    rows = []
+    for name in ("상승장", "횡보장", "하락장"):
+        m = (reg == name) & strat.notna()
+        n = int(m.sum())
+        if n == 0:
+            continue
+        ann = lambda r: float((1 + r[m].fillna(0)).prod() ** (252 / n) - 1) * 100
+        rows.append({"국면": name, "거래일": n, "전략 연환산%": ann(strat), f"{result.market.label(benchmark)} 연환산%": ann(bh)})
+    return pd.DataFrame(rows)
 
 
 def trades_frame(result: BacktestResult) -> pd.DataFrame:
@@ -383,7 +544,7 @@ def trades_frame(result: BacktestResult) -> pd.DataFrame:
 @dataclass
 class MarketBacktest:
     result: BacktestResult
-    walk_forward: WalkForwardResult
+    walk_forward: WalkForwardResult | None
     model_eval: dict[str, float]
     table: pd.DataFrame
     info: dict[str, Any]
@@ -407,3 +568,17 @@ def backtest_market(cfg: AppConfig, market_key: str, bars: dict[str, pd.DataFram
     table, info = summarize(result)
     model_eval = evaluate_predictions(ds, wf.prob, cfg.strategy.entry_threshold)
     return MarketBacktest(result=result, walk_forward=wf, model_eval=model_eval, table=table, info=info)
+
+
+def backtest_rules(cfg: AppConfig, market_key: str, bars: dict[str, pd.DataFrame]) -> MarketBacktest:
+    """규칙 전략: 학습이 없으므로 워크포워드 없이, 파라미터는 사전에 고정(결과를 보고 고치지 않음)."""
+    from .rules import first_valid_time, trend_breakout
+
+    market = cfg.market(market_key)
+    signals = {s: trend_breakout(df, cfg.strategy) for s, df in bars.items()}
+    starts = [t for t in (first_valid_time(sig) for sig in signals.values()) if t is not None]
+    if not starts:
+        raise ValueError("규칙 신호를 계산할 만큼 데이터가 길지 않습니다 (장기 이동평균 기간 부족)")
+    result = run_backtest(bars, signals, market, cfg.strategy, cfg.risk, start=min(starts))
+    table, info = summarize(result)
+    return MarketBacktest(result=result, walk_forward=None, model_eval={}, table=table, info=info)

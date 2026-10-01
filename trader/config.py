@@ -124,11 +124,22 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class StrategyConfig:
+    type: str = "ml"  # ml: 1시간봉 머신러닝 / rule_breakout: 일봉 추세 돌파 규칙
+    # --- ml ---
     entry_threshold: float = 0.50
     min_expected_return_pct: float = 0.0
     exit_threshold: float = 0.45
     max_hold_bars: int = 0
     flatten_at_session_end: bool = True
+    # --- rule_breakout (일봉) ---
+    long_ma: int = 200  # 추세 필터: 종가 > 장기 이동평균
+    breakout_lookback: int = 20  # 진입: 종가 > 직전 N일(당일 제외) 최고 종가
+    exit_ma: int = 20  # 청산: 종가 < 이 이동평균
+    score_lookback: int = 20  # 후보가 넘칠 때 N일 수익률 높은 순
+    # --- 공통 주문 규칙 ---
+    entry_limit_pct: float = 0.0  # >0 이면 매수 지정가 = 신호일 종가 × (1+N%). 시가가 더 높으면 미체결
+    max_positions: int = 0  # 0 = 제한 없음
+    reentry_cooldown_bars: int = 0  # 청산 후 N봉 동안 재진입 금지
 
     @property
     def min_expected_return(self) -> float:
@@ -138,6 +149,7 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     stop_loss_pct: float = 1.0
+    stop_check: str = "intrabar"  # intrabar: 봉 중 저가로 판단 / close: 종가로 판단 → 다음 봉 시가 청산
     position_size_pct: float = 20.0
     max_drawdown_pct: float = 10.0
     liquidate_on_halt: bool = True
@@ -240,6 +252,19 @@ def _validate(cfg: AppConfig) -> None:
         raise ConfigError("risk.max_drawdown_pct 는 0~100 사이여야 합니다")
     if r.max_trades_per_day < 1:
         raise ConfigError("risk.max_trades_per_day 는 1 이상이어야 합니다")
+    if s.type not in {"ml", "rule_breakout"}:
+        raise ConfigError(f"strategy.type '{s.type}' 는 지원하지 않습니다 (ml | rule_breakout)")
+    if r.stop_check not in {"intrabar", "close"}:
+        raise ConfigError("risk.stop_check 는 intrabar | close")
+    if min(s.long_ma, s.breakout_lookback, s.exit_ma, s.score_lookback) < 1:
+        raise ConfigError("strategy 의 이동평균·기간 값은 1 이상이어야 합니다")
+    if s.entry_limit_pct < 0 or s.max_positions < 0 or s.reentry_cooldown_bars < 0:
+        raise ConfigError("strategy.entry_limit_pct / max_positions / reentry_cooldown_bars 는 0 이상이어야 합니다")
+    daily = cfg.data.interval.endswith("d")
+    if s.type == "rule_breakout" and not daily:
+        raise ConfigError("strategy.type=rule_breakout 은 일봉 전용입니다 (data.interval: 1d)")
+    if daily and s.flatten_at_session_end:
+        raise ConfigError("일봉에서는 strategy.flatten_at_session_end 를 false 로 두세요 (모든 봉이 '마지막 봉'이라 진입이 막힘)")
     if m.type not in {"hgb", "logistic", "random_forest"}:
         raise ConfigError(f"model.type '{m.type}' 는 지원하지 않습니다 (hgb | logistic | random_forest)")
     if m.min_train_days < 20 or m.retrain_every_days < 1 or m.train_window_days < 0:
