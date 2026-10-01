@@ -235,3 +235,16 @@ def test_vts_drawdown_baseline_is_first_broker_balance(vts):
     assert not rep.halted and rep.drawdown == 0
     assert load_state(cfg, tmp_path, "vts").risk["peak_equity"] == 8_500_000.0
     assert not (tmp_path / "state" / "trade_state_kr_paper.json").exists()  # 가상계좌 상태와 분리
+
+
+def test_resume_clears_halt_and_resets_peak(setup):
+    cfg, ctx, tmp_path, tickers = setup
+    path = tmp_path / "state" / "trade_state_kr_paper.json"
+    st = live.TradeState.load(path, cfg.market("kr"))
+    st.risk = {"peak_equity": 20_000_000.0, "halted": True, "halt_reason": "테스트", "halted_at": "x", "daily_entries": {}}
+    st.save()
+    now = kst("2025-03-14 10:05")
+    assert live.run_trade_cycle(cfg, "kr", now=now).halted  # halted 를 풀지 않으면 그대로
+    rep = live.run_trade_cycle(cfg, "kr", now=now + pd.Timedelta(hours=1), resume=True)
+    assert not rep.halted and any("재개" in n for n in rep.notes)
+    assert load_state(cfg, tmp_path).risk["peak_equity"] == pytest.approx(rep.equity, rel=0.01)

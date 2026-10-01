@@ -90,3 +90,14 @@ class RiskManager:
             rm.halted_at = state.get("halted_at")
             rm.daily_entries = {str(k): int(v) for k, v in (state.get("daily_entries") or {}).items()}
         return rm
+
+
+def resume_state(risk_state: dict[str, Any], resume: bool) -> list[str]:
+    """trade --resume: 매매 중단을 풀고 고점 기준을 비운다 (다음 평가금액이 새 고점).
+    halted 만 false 로 바꾸면 옛 고점 대비 낙폭이 그대로라 다음 실행에서 곧바로 다시 멈춘다."""
+    if not resume:
+        return []
+    if not risk_state.get("halted"):
+        return ["--resume: 매매 중단 상태가 아니라서 바꾼 것이 없습니다"]
+    risk_state.update(halted=False, halt_reason=None, halted_at=None, peak_equity=None)
+    return ["매매 재개: 중단을 풀고 고점 기준을 이번 평가금액으로 다시 잡습니다"]

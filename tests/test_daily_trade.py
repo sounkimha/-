@@ -63,6 +63,23 @@ def run_days(cfg, ctx, days):
     return events, reps
 
 
+def assert_same_fills(market, bt, events):
+    def key(day, s, qty, price, reason=""):
+        return (day, market.label(s) if "(" not in s else s, int(qty), round(float(price), 2), reason)
+
+    buys = sorted(key(e["일자"], e["종목"], e["수량"], e["가격"]) for e in events if e["구분"] == "매수")
+    sells = sorted(key(e["일자"], e["종목"], e["수량"], e["가격"], e["사유"]) for e in events if e["구분"] == "매도")
+    bt_buys = sorted(key(f"{t.entry_time:%Y-%m-%d}", t.symbol, t.qty, t.entry_price) for t in bt.trades)
+    bt_sells = sorted(
+        key(f"{t.exit_time:%Y-%m-%d}", t.symbol, t.qty, t.exit_price, dt.REASONS.get(t.exit_reason, t.exit_reason))
+        for t in bt.trades if t.exit_reason != "end_of_data"
+    )
+    assert len(bt.trades) >= 6  # 비교가 의미 있을 만큼 거래가 있어야 함
+    assert buys == bt_buys
+    assert sells == bt_sells
+    assert sum(e["구분"] == "미체결" for e in events) == bt.unfilled_entries
+
+
 @pytest.mark.parametrize(
     "mdd, size, max_pos, stop, limit",
     [
@@ -85,20 +102,7 @@ def test_paper_account_matches_backtest_day_by_day(paper, mdd, size, max_pos, st
     days = [d for d in next(iter(full.values())).index if d >= start]
     events, reps = run_days(cfg, ctx, days)
 
-    def key(day, s, qty, price, reason=""):
-        return (day, market.label(s) if "(" not in s else s, int(qty), round(float(price), 2), reason)
-
-    buys = sorted(key(e["일자"], e["종목"], e["수량"], e["가격"]) for e in events if e["구분"] == "매수")
-    sells = sorted(key(e["일자"], e["종목"], e["수량"], e["가격"], e["사유"]) for e in events if e["구분"] == "매도")
-    bt_buys = sorted(key(f"{t.entry_time:%Y-%m-%d}", t.symbol, t.qty, t.entry_price) for t in bt.trades)
-    bt_sells = sorted(
-        key(f"{t.exit_time:%Y-%m-%d}", t.symbol, t.qty, t.exit_price, dt.REASONS.get(t.exit_reason, t.exit_reason))
-        for t in bt.trades if t.exit_reason != "end_of_data"
-    )
-    assert len(bt.trades) >= 6  # 비교가 의미 있을 만큼 거래가 있어야 함
-    assert buys == bt_buys
-    assert sells == bt_sells
-    assert sum(e["구분"] == "미체결" for e in events) == bt.unfilled_entries
+    assert_same_fills(market, bt, events)
     equity = pd.read_csv(dt.daily_files(cfg, "kr", True)["equity"], encoding="utf-8-sig")
     assert equity["평가금액"].iloc[-2] == pytest.approx(bt.equity.iloc[-2], abs=0.01)  # 마지막 날은 백테스트가 강제 청산
     assert (bt.halted_at is not None) == reps[-1].halted == (mdd == 4.0)
@@ -110,6 +114,49 @@ def test_paper_account_matches_backtest_day_by_day(paper, mdd, size, max_pos, st
         assert not any(e["구분"] == "매수" and e["일자"] > f"{bt.halted_at:%Y-%m-%d}" for e in events)
 
 
+def test_paper_waits_for_lagging_or_failed_symbols_and_still_matches_backtest(paper, monkeypatch):
+    full, ctx, tmp_path = paper
+    cfg = small_cfg(tmp_path, max_drawdown_pct=40.0)
+    lag_sym, err_sym = list(full)[:2]
+
+    def flaky_load(cfg, mk, offline=False, refresh=False, now=None):
+        out = {s: df[df.index <= ctx["upto"]] for s, df in full.items()}
+        errors = {}
+        if ctx["i"] % 4 == 1:  # 한 종목만 오늘 봉이 아직 안 들어옴
+            out[lag_sym] = out[lag_sym].iloc[:-1]
+        if ctx["i"] % 7 == 3:  # 한 종목 수집 실패
+            errors[err_sym] = f"{err_sym}: 가짜 실패"
+            del out[err_sym]
+        return out, errors
+
+    monkeypatch.setattr(dt, "load_market", flaky_load)
+    sigs = {s: trend_breakout(df, cfg.strategy) for s, df in full.items()}
+    start = min(first_valid_time(x) for x in sigs.values())
+    bt = run_backtest(full, sigs, cfg.market("kr"), cfg.strategy, cfg.risk, start=start)
+    days = [d for d in next(iter(full.values())).index if d >= start]
+    events, waited = [], 0
+    for i, d in enumerate(days, start=1):  # 첫 실행(i=0 자리)은 지연 없이 시작
+        ctx["i"], ctx["upto"] = i if i > 1 else 0, d
+        rep = dt.run_daily_cycle(cfg, "kr", now=d + pd.Timedelta(hours=17))
+        events += rep.events
+        waited += any("기다립니다" in n or "처리하지 않습니다" in n for n in rep.notes)
+    assert waited >= 10
+    assert_same_fills(cfg.market("kr"), bt, events)
+
+
+def test_paper_resume_after_halt_resets_peak(paper):
+    full, ctx, tmp_path = paper
+    cfg = small_cfg(tmp_path, max_drawdown_pct=4.0)
+    days = list(next(iter(full.values())).index[30:])
+    _, reps = run_days(cfg, ctx, days[:-5])
+    assert reps[-1].halted
+    ctx["upto"] = days[-5]
+    rep = dt.run_daily_cycle(cfg, "kr", now=days[-5] + pd.Timedelta(hours=17), resume=True)
+    assert not rep.halted and any("재개" in n for n in rep.notes)
+    _, reps = run_days(cfg, ctx, days[-4:])
+    assert not reps[0].halted  # 옛 고점 때문에 바로 다시 멈추지 않음
+
+
 def test_paper_catches_up_missed_days_and_is_idempotent(paper):
     full, ctx, tmp_path = paper
     every = small_cfg(tmp_path / "every", max_drawdown_pct=40.0)
@@ -118,7 +165,7 @@ def test_paper_catches_up_missed_days_and_is_idempotent(paper):
     run_days(every, ctx, days)
     events_gap, reps = run_days(gaps, ctx, [days[0], days[10], days[11], days[40], days[-1], days[-1]])
     assert "밀린" in " ".join(reps[1].notes)
-    assert reps[-1].events == [] and "새 일봉이 없습니다" in " ".join(reps[-1].notes)  # 같은 날 두 번 실행해도 중복 처리 없음
+    assert reps[-1].events == [] and "처리할 일봉이 없습니다" in " ".join(reps[-1].notes)  # 같은 날 두 번 실행해도 중복 처리 없음
     a = dt.DailyState.load(dt.daily_files(every, "kr", True)["state"])
     b = dt.DailyState.load(dt.daily_files(gaps, "kr", True)["state"])
     assert a.cash == pytest.approx(b.cash) and a.positions == b.positions and a.pending == b.pending
@@ -191,9 +238,9 @@ def vts(tmp_path, monkeypatch):
     fake = FakeBroker()
     monkeypatch.setattr(trader.broker, "make_broker", lambda *a, **k: fake)
     cfg = small_cfg(tmp_path, max_drawdown_pct=40.0)
-    cfg = replace(cfg, strategy=replace(cfg.strategy, max_positions=3))
-    s = list(cfg.market("kr").symbols)
-    A, B, C, D, E = s[:5]
+    universe = dict(list(cfg.market("kr").symbols.items())[:6])  # 테스트 데이터가 있는 6종목만
+    cfg = replace(cfg, strategy=replace(cfg.strategy, max_positions=3), markets={"kr": replace(cfg.market("kr"), symbols=universe)})
+    A, B, C, D, E, F = universe
     up = lambda top: np.linspace(100, top, 40)  # noqa: E731  매일 신고가 → 마지막 날 진입 신호
     bars = {
         A: daily_bars(list(np.linspace(100, 130, 35)) + [125, 120, 115, 110, 105], start="2025-01-13"),  # 20일선 이탈
@@ -201,6 +248,7 @@ def vts(tmp_path, monkeypatch):
         C: daily_bars(up(135), start="2025-01-13"),
         D: daily_bars(up(132), start="2025-01-13"),
         E: daily_bars(up(150), start="2025-01-13"),  # 직접 보유 중인 종목 → 사지 않음
+        F: daily_bars([100.0] * 40, start="2025-01-13"),  # 신호 없음
     }
     assert all(df.index[-1] == pd.Timestamp("2025-03-07", tz=KST) for df in bars.values())  # 금요일
     monkeypatch.setattr(dt, "load_market", lambda *a, **k: (bars, {}))
@@ -259,7 +307,7 @@ def test_vts_check_phase_records_fills_cancels_rest_and_places_deferred(vts):
     assert any(e["구분"] == "미체결" and D in e["종목"] for e in rep.events)  # 시가 > 지정가 → 주문 안 함
     assert st.deferred == []
     kinds = [e["구분"] for e in rep.events]
-    assert {"매도 체결", "매수 체결", "매수 잔량 취소", "매수 주문", "미체결"} <= set(kinds)
+    assert {"매도 체결", "매수 체결", "매수 잔량 취소 요청", "매수 주문", "미체결"} <= set(kinds)
 
 
 def test_vts_rejected_auction_sell_is_retried_once_after_open(vts):
@@ -321,6 +369,108 @@ def test_vts_halt_during_check_phase_drops_deferred_buys(vts):
     rep = dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 09:05"))
     assert rep.halted and dt.DailyState.load(files["state"]).deferred == []
     assert not any(p[0] == "buy" and p[1] in (C, D) for p in fake.placed)
+
+
+def test_vts_rejected_sell_does_not_free_a_slot(vts):
+    cfg, fake, bars, (A, B, C, D, E), files = vts
+    F = list(cfg.market("kr").symbols)[5]
+    bars[F] = daily_bars(np.linspace(100, 120, 40), start="2025-01-13")
+    st = dt.DailyState.load(files["state"])
+    st.positions[F] = {"qty": 1000, "entry_price": 110.0, "stop_price": 101.2, "entry_date": "2025-02-20"}
+    st.save()
+    fake.positions[F] = Position(F, 1000, 110.0, 120.0, sellable_qty=1000)
+    fake.cash = 3_000_000.0  # 현금은 넉넉 → 빈자리만이 제한
+    fake.reject = {("sell", A)}  # A 매도는 동시호가에서도, 재시도에서도 거부
+    for t in ("08:35", "09:05", "09:20", "09:35"):
+        dt.run_daily_cycle(cfg, "kr", now=kst(f"2025-03-10 {t}"))
+    bought = [p[1] for p in fake.placed if p[0] == "buy"]
+    assert bought == [B]  # 최대 3종목: A·F 보유 중이라 빈자리는 1개뿐
+    assert set(dt.DailyState.load(files["state"]).positions) == {A, F}
+
+
+def test_vts_deferred_buy_waits_for_a_slot_that_never_frees(vts):
+    cfg, fake, bars, (A, B, C, D, E), files = vts
+    F = list(cfg.market("kr").symbols)[5]
+    bars[F] = daily_bars(np.linspace(100, 120, 40), start="2025-01-13")
+    st = dt.DailyState.load(files["state"])
+    st.positions[F] = {"qty": 1000, "entry_price": 110.0, "stop_price": 101.2, "entry_date": "2025-02-20"}
+    st.save()
+    fake.positions[F] = Position(F, 1000, 110.0, 120.0, sellable_qty=1000)
+    dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 08:35"))  # A 매도 접수 → 빈자리 2: B 매수, C 는 현금 대기
+    st = dt.DailyState.load(files["state"])
+    assert [d["symbol"] for d in st.deferred] == [C]
+    no = {o["symbol"]: o["order_no"] for o in st.orders}
+    (_, _, qa, _), (_, _, qb, _) = fake.placed
+    fake.fill("20250310", no[A], A, "sell", qa, 0, 0.0)  # A 매도는 접수됐지만 체결 없이 취소됨
+    fake.rows["20250310"][-1]["cncl_yn"] = "Y"
+    fake.fill("20250310", no[B], B, "buy", qb, qb, 142.0)
+    fake.positions[B] = Position(B, qb, 142.0, 142.0, sellable_qty=qb)
+    fake.cash = 3_000_000.0
+    fake.quotes = {C: {"price": 100.0, "open": 100.0, "base": 0.0}}
+    rep = dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 09:05"))
+    assert not any(p[:2] == ("buy", C) for p in fake.placed)  # A·F·B 로 이미 3종목
+    assert any(e["구분"] == "매수 못함" and "빈자리" in e["비고"] for e in rep.events)
+
+
+def test_vts_order_phase_can_rerun_after_transient_quote_failure(vts, monkeypatch):
+    cfg, fake, bars, (A, B, C, D, E), files = vts
+    cut = {s: df.iloc[:-1] for s, df in bars.items()}  # 금요일 휴장 → 기준가로 최신 여부 판단
+    monkeypatch.setattr(dt, "load_market", lambda *a, **k: (cut, {}))
+    fake.cash = 3_000_000.0
+    calls = {"n": 0}
+
+    def quote(s):
+        if s == A:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise trader.broker.KisApiError("EGW00201 초당 거래건수 초과")
+        return {"price": 0.0, "open": 0.0, "base": float(cut[s]["close"].iloc[-1])}
+
+    fake.quote = quote
+    first = dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 08:35"))
+    assert not any(p[:2] == ("sell", A) for p in fake.placed)
+    assert dt.DailyState.load(files["state"]).order_phase_date is None
+    assert any("다시 실행" in n for n in first.notes)
+    n_buys = sum(p[0] == "buy" for p in fake.placed)
+    dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 08:40"))
+    assert [p for p in fake.placed if p[:2] == ("sell", A)] == [("sell", A, 2000, None)]
+    assert sum(p[0] == "buy" for p in fake.placed) >= n_buys
+    assert len({p[1] for p in fake.placed if p[0] == "buy"}) == sum(p[0] == "buy" for p in fake.placed)  # 같은 종목 두 번 주문 없음
+    assert dt.DailyState.load(files["state"]).order_phase_date == "2025-03-10"
+
+
+def test_vts_fill_between_inquiry_and_cancel_is_recorded(vts):
+    cfg, fake, bars, (A, B, C, D, E), files = vts
+    dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 08:35"))
+    st = dt.DailyState.load(files["state"])
+    no = {o["symbol"]: o["order_no"] for o in st.orders}
+    (_, _, qa, _), (_, _, qb, _) = fake.placed
+    fake.fill("20250310", no[A], A, "sell", qa, qa, 104.0)
+    fake.fill("20250310", no[B], B, "buy", qb, 0, 0.0)  # 조회 시점엔 0주
+    dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 09:05"))
+    assert fake.cancels and dt.DailyState.load(files["state"]).positions.get(B) is None
+    # 취소가 닿기 전에 30주가 체결됐고 나머지는 취소됨
+    fake.rows["20250310"] = [r for r in fake.rows["20250310"] if r["odno"] != no[B]]
+    fake.fill("20250310", no[B], B, "buy", qb, 30, 142.0)
+    fake.rows["20250310"][-1]["rmn_qty"] = "0"
+    dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 09:20"))
+    st = dt.DailyState.load(files["state"])
+    assert st.positions[B]["qty"] == 30
+    assert next(o for o in st.orders if o["symbol"] == B)["status"] == "partial"
+    assert len(fake.cancels) == 1  # 취소를 두 번 보내지 않음
+
+
+def test_vts_reconcile_updates_exit_date_and_caps_sellable(vts):
+    cfg, fake, bars, (A, B, C, D, E), files = vts
+    st = dt.DailyState.load(files["state"])
+    st.last_exit[A] = "2025-01-15"  # 예전에 한 번 팔았던 종목
+    st.positions[B] = {"qty": 5, "entry_price": 120.0, "stop_price": 110.4, "entry_date": "2025-02-20"}
+    st.save()
+    fake.positions = {B: Position(B, 8, 120.0, 140.0, sellable_qty=None), E: fake.positions[E]}  # B 3주는 직접 산 것
+    dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 16:00"))
+    st = dt.DailyState.load(files["state"])
+    assert st.last_exit[A] == "2025-03-10"  # 잔고에서 사라진 날로 갱신 → 재진입 대기 적용
+    assert st.positions[B]["sellable"] == 5
 
 
 def test_vts_outside_windows_only_reads(vts):

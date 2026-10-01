@@ -32,7 +32,7 @@ from .data import (
 )
 from .features import make_dataset
 from .model import predict_latest
-from .risk import RiskManager
+from .risk import RiskManager, resume_state
 
 log = logging.getLogger(__name__)
 
@@ -202,6 +202,7 @@ def run_trade_cycle(
     offline: bool = False,
     ignore_hours: bool = False,
     now: pd.Timestamp | None = None,
+    resume: bool = False,
 ) -> CycleReport:
     market = cfg.market(market_key)
     interval = cfg.data.interval
@@ -212,6 +213,7 @@ def run_trade_cycle(
 
     signals, errors = compute_signals(cfg, market_key, offline=offline, now=now)
     state = TradeState.load(state_path(cfg, market_key, dry_run), market)
+    notes.extend(resume_state(state.risk, resume))
     # 낙폭 기준: 가상계좌는 설정의 시작금액, 모의투자는 첫 잔고 조회값에서 시작
     rm = RiskManager.from_state(cfg.risk, state.risk, market.initial_capital if dry_run else None)
     open_now = is_market_open(now, market)
@@ -284,7 +286,7 @@ def run_trade_cycle(
                     continue
                 intents.append(OrderIntent("sell", s, h.sellable, prices[s], reason))
             if rm.halted:
-                notes.append(f"매매 중단 상태: {rm.halt_reason} (state 파일을 확인하고 사람이 직접 해제)")
+                notes.append(f"매매 중단 상태: {rm.halt_reason} (원인을 확인한 뒤 trade --resume 으로 재개)")
             elif cfg.strategy.flatten_at_session_end and last_bar_now:
                 notes.append("장 마지막 봉 구간 → 신규 진입 없음")
             else:

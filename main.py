@@ -328,7 +328,7 @@ def trade_rules(cfg, args) -> int:
     """일봉 규칙: DRY_RUN 이면 가상계좌 정산·계획, 아니면 모의투자 주문/확인 단계."""
     from trader.daily_trade import run_daily_cycle
 
-    rep = run_daily_cycle(cfg, args.market, offline=args.offline)
+    rep = run_daily_cycle(cfg, args.market, offline=args.offline, resume=args.resume)
     m = rep.market
     mode = "DRY_RUN — 가상계좌 (주문 전송 안 함)" if rep.dry_run else "모의투자 서버로 주문 전송"
     print(f"\n## {m.name} 매매 사이클 — {rep.now:%Y-%m-%d %H:%M %Z} · 모드: {mode} · 단계: {rep.phase}")
@@ -367,7 +367,7 @@ def cmd_trade(cfg, args) -> int:
         return trade_rules(cfg, args)
     from trader.live import run_trade_cycle
 
-    rep = run_trade_cycle(cfg, args.market, offline=args.offline, ignore_hours=args.ignore_hours)
+    rep = run_trade_cycle(cfg, args.market, offline=args.offline, ignore_hours=args.ignore_hours, resume=args.resume)
     m = rep.market
     mode = "DRY_RUN (주문 전송 안 함 · 가상계좌)" if rep.dry_run else "모의투자 서버로 주문 전송"
     print(f"\n## {m.name} 매매 사이클 — {rep.now:%Y-%m-%d %H:%M %Z} · 모드: {mode}")
@@ -440,6 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--market", required=True, help="kr | us")
     s.add_argument("--offline", action="store_true", help="네트워크 없이 캐시만 사용")
     s.add_argument("--ignore-hours", action="store_true", help="DRY_RUN 일 때만: 장 시간이 아니어도 가상계좌로 진행")
+    s.add_argument("--resume", action="store_true", help="계좌 낙폭 한도로 멈춘 매매를 재개 (고점 기준을 지금 평가금액으로 다시 잡음)")
     s.set_defaults(func=cmd_trade)
 
     s = sub.add_parser("broker-check", help="모의투자 토큰·잔고·시세 조회 (주문 없음)")

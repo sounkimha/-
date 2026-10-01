@@ -31,7 +31,7 @@ from .broker.kis_client import KisError, to_float
 from .config import AppConfig, ConfigError, MarketConfig, is_dry_run, load_credentials, load_env
 from .daily import buy_limit_price
 from .data import DataError, expected_latest_bar, load_market
-from .risk import RiskManager
+from .risk import RiskManager, resume_state
 from .rules import trend_breakout
 
 log = logging.getLogger(__name__)
@@ -39,9 +39,11 @@ log = logging.getLogger(__name__)
 # 확인 단계는 09:02 부터: 09:00 동시호가 체결이 조회에 잡히기 전에 '미체결'로 보고 취소하지 않도록
 ORDER_START, ORDER_END, CHECK_START, CHECK_END = time(8, 30), time(9, 0), time(9, 2), time(15, 20)
 REASONS = {"signal": "청산선 이탈", "stop": "손절", "halt": "계좌 낙폭 한도", "entry": "추세 돌파"}
+MAX_LAG_DAYS = 3  # 가상계좌: 한 종목의 최신 일봉이 이 거래일 수까지 늦으면 기다리고, 더 늦으면 거래정지로 본다
 JOURNAL_COLUMNS = ["일자", "구분", "종목", "수량", "가격", "금액", "비용", "손익", "사유", "비고"]
 EQUITY_COLUMNS = ["일자", "현금", "평가금액", "고점대비%", "보유종목수"]
-_OPEN_STATUSES = ("submitted", "uncertain")
+_LIVE = ("submitted", "uncertain")  # 결과를 아직 모르는 주문
+_OPEN_STATUSES = _LIVE + ("cancel_requested",)  # 체결 조회로 다시 확인할 주문 (취소 요청 뒤 체결된 수량까지 반영)
 
 
 # --------------------------------------------------------------------------
@@ -136,7 +138,7 @@ def _cooling(bars: pd.DataFrame, last_exit: str | None, at: pd.Timestamp, n: int
 # 진입점
 # --------------------------------------------------------------------------
 def run_daily_cycle(
-    cfg: AppConfig, market_key: str, *, offline: bool = False, now: pd.Timestamp | None = None
+    cfg: AppConfig, market_key: str, *, offline: bool = False, now: pd.Timestamp | None = None, resume: bool = False
 ) -> DailyReport:
     if cfg.strategy.type != "rule_breakout":
         raise ConfigError("run_daily_cycle 은 strategy.type=rule_breakout 전용입니다")
@@ -152,35 +154,51 @@ def run_daily_cycle(
     sigs = {s: trend_breakout(df, cfg.strategy) for s, df in bars.items()}
     files = daily_files(cfg, market_key, dry_run)
     state = DailyState.load(files["state"])
+    notes = resume_state(state.risk, resume)
     run = _paper_cycle if dry_run else _vts_cycle
-    return run(cfg, market, bars, sigs, state, now, errors, files)
+    return run(cfg, market, bars, sigs, state, now, errors, files, notes)
 
 
-# --------------------------------------------------------------------------
-# DRY_RUN: 가상계좌 (백테스트 엔진과 같은 순서로 하루씩 처리)
-# --------------------------------------------------------------------------
-def _paper_cycle(cfg, market, bars, sigs, state, now, errors, files) -> DailyReport:
+def _horizon(market, bars, syms, dates, notes) -> pd.Timestamp:
+    """모든 종목에 일봉이 있는 마지막 날. 늦게 들어오는 종목을 기다려야 그날을 빠뜨리지 않는다."""
+    pos = {d: i for i, d in enumerate(dates)}
+    last = horizon = dates[-1]
+    for s in syms:
+        s_last = bars[s].index[-1]
+        lag = pos[last] - pos[s_last]
+        if lag == 0:
+            continue
+        if lag <= MAX_LAG_DAYS:
+            horizon = min(horizon, s_last)
+            notes.append(f"{market.label(s)}: 최신 일봉이 아직 없습니다 (마지막 {s_last:%Y-%m-%d}) → 모든 종목을 그날까지만 처리하고 기다립니다")
+        else:
+            notes.append(f"{market.label(s)}: {lag}거래일째 새 일봉이 없습니다 → 거래정지 등으로 보고 기다리지 않습니다")
+    return horizon
+
+
+def _paper_cycle(cfg, market, bars, sigs, state, now, errors, files, notes) -> DailyReport:
     st, rk, costs = cfg.strategy, cfg.risk, market.costs
-    notes: list[str] = []
     acct = Account(market.initial_capital if state.cash is None else state.cash, costs)
     acct.positions = {s: Trade.from_dict(d) for s, d in state.positions.items()}
     rm = RiskManager.from_state(rk, state.risk, market.initial_capital)
     syms = [s for s in market.symbols if s in bars]
     dates = sorted(set().union(*(set(bars[s].index) for s in syms)))
-    if state.last_date is None:
-        todo = dates[-1:]
+    horizon = _horizon(market, bars, syms, dates, notes)
+    if errors:  # 한 종목이라도 못 받으면 그날을 건너뛰지 않도록 전체를 미룬다 (다음 실행 때 밀린 날로 처리)
+        todo = []
+        notes.append("데이터 수집에 실패한 종목이 있어 오늘은 처리하지 않습니다 (가상계좌 그대로, 다음 실행 때 밀린 날을 처리)")
+    elif state.last_date is None:
+        todo = [horizon]
         notes.append(
             f"가상계좌를 {market.initial_capital:,.0f}{market.currency}로 시작합니다. "
-            f"{todo[0]:%Y-%m-%d} 종가로 계획한 주문이 다음 거래일 시가에 처음 체결됩니다."
+            f"{horizon:%Y-%m-%d} 종가로 계획한 주문이 다음 거래일 시가에 처음 체결됩니다."
         )
     else:
-        todo = [d for d in dates if f"{d:%Y-%m-%d}" > state.last_date]
+        todo = [d for d in dates if f"{d:%Y-%m-%d}" > state.last_date and d <= horizon]
         if not todo:
-            notes.append(f"새 일봉이 없습니다 (마지막 처리 {state.last_date}). 장 마감 후 데이터가 들어오면 다시 실행하세요.")
+            notes.append(f"새로 처리할 일봉이 없습니다 (마지막 처리 {state.last_date}). 장 마감 후 데이터가 들어오면 다시 실행하세요.")
         elif len(todo) > 1:
             notes.append(f"밀린 {len(todo)}거래일을 순서대로 처리했습니다.")
-    if errors:
-        notes.append("데이터 수집에 실패한 종목은 그날 정산·판단을 건너뜁니다 (주문은 다음에 데이터가 있는 날로 밀림).")
     pending = {o["symbol"]: o for o in state.pending}
     last_close = dict(state.last_close)
     events: list[dict] = []
@@ -226,7 +244,7 @@ def _paper_cycle(cfg, market, bars, sigs, state, now, errors, files) -> DailyRep
             # 2) 종가 평가 → 계좌 낙폭
             equity = acct.equity({s: last_close.get(s, t.entry_price) for s, t in acct.positions.items()})
             if rm.update_equity(equity, day):
-                notes.append(f"{day}: 계좌 낙폭 한도 도달 → 매매 중단 ({rm.halt_reason}). 재개는 상태 파일의 risk.halted 를 사람이 직접 false 로")
+                notes.append(f"{day}: 계좌 낙폭 한도 도달 → 매매 중단 ({rm.halt_reason}). 원인을 확인한 뒤 trade --resume 으로 재개")
             if rm.halted:
                 for s in [s for s, o in pending.items() if o["side"] == "buy"]:
                     del pending[s]
@@ -380,15 +398,17 @@ def _apply_fills(rows, orders, state, broker, market, rk, events, notes, *, canc
                         state.positions.pop(s)
                         state.last_exit[s] = day
         if rest > 0 and not cancelled:
-            if o["side"] == "buy" and cancel_rest:
+            if o["status"] == "cancel_requested":  # 취소가 닿기 전 체결분은 다음 조회에서 반영된다
+                notes.append(f"{market.label(s)}: 매수 잔량 {rest}주 취소 확인 대기")
+            elif o["side"] == "buy" and cancel_rest:
                 try:
                     res = broker.cancel(s, str(o["order_no"]), str(o.get("org_no") or ""), rest)
                 except KisError as e:
                     notes.append(f"{market.label(s)}: 미체결 매수 취소 실패 ({e}) → 다음 확인 때 다시 시도")
                     continue
                 if res.ok:
-                    o["status"] = "cancelled" if filled == 0 else "partial"
-                    events.append(_event(day, "매수 잔량 취소", market, s, rest, o.get("limit"), reason=o["reason"], note="시가에 체결되지 않은 지정가"))
+                    o["status"] = "cancel_requested"
+                    events.append(_event(day, "매수 잔량 취소 요청", market, s, rest, o.get("limit"), reason=o["reason"], note="시가에 체결되지 않은 지정가"))
                 else:
                     notes.append(f"{market.label(s)}: 미체결 매수 취소 거부 ({res.message}) → 다음 확인 때 다시 시도")
             else:
@@ -397,7 +417,7 @@ def _apply_fills(rows, orders, state, broker, market, rk, events, notes, *, canc
             o["status"] = "filled" if filled >= o["qty"] else ("cancelled" if filled == 0 else "partial")
 
 
-def _vts_cycle(cfg, market, bars, sigs, state, now, errors, files) -> DailyReport:
+def _vts_cycle(cfg, market, bars, sigs, state, now, errors, files, notes) -> DailyReport:
     from .broker import make_broker  # 실제 전송 모드에서만 증권사 모듈 사용
 
     creds = load_credentials()
@@ -407,7 +427,6 @@ def _vts_cycle(cfg, market, bars, sigs, state, now, errors, files) -> DailyRepor
     rk = cfg.risk
     today = f"{now:%Y-%m-%d}"
     phase = vts_phase(now)
-    notes: list[str] = []
     events: list[dict] = []
     rm = RiskManager.from_state(rk, state.risk, None)  # 낙폭 기준은 첫 잔고 조회값에서 시작
     bal = None
@@ -429,13 +448,13 @@ def _vts_cycle(cfg, market, bars, sigs, state, now, errors, files) -> DailyRepor
             pos = bal.positions.get(s)
             if pos is None or pos.qty <= 0:
                 state.positions.pop(s)
-                state.last_exit.setdefault(s, today)
+                state.last_exit[s] = today
                 notes.append(f"{market.label(s)}: 잔고에 없음 → 관리 종료 (직접 매도했거나 체결 기록을 놓침)")
                 continue
             if pos.qty < int(memo["qty"]):
                 notes.append(f"{market.label(s)}: 잔고 {pos.qty}주 < 기록 {memo['qty']}주 → 잔고 기준으로 맞춤")
                 memo["qty"] = pos.qty
-            memo["sellable"] = pos.qty if pos.sellable_qty is None else min(pos.sellable_qty, int(memo["qty"]))
+            memo["sellable"] = min(int(memo["qty"]), pos.qty if pos.sellable_qty is None else pos.sellable_qty)
             memo["last_price"] = pos.last_price
         unmanaged = sorted(s for s in bal.positions if s not in state.positions)
         if unmanaged:
@@ -484,11 +503,18 @@ def _vts_cycle(cfg, market, bars, sigs, state, now, errors, files) -> DailyRepor
 
 
 def _vts_order_phase(cfg, market, bars, sigs, state, bal, unmanaged, broker, rm, now, events, notes) -> None:
+    """동시호가 주문. 종목 단위로 한 번만 주문하고, 일시 오류로 판단 못 한 종목이 있으면 다시 실행할 수 있게 남긴다."""
     st, rk = cfg.strategy, cfg.risk
     today = f"{now:%Y-%m-%d}"
+    fee = market.costs.commission
+    done = {o["symbol"] for o in state.orders if o["date"] == today} | {d["symbol"] for d in state.deferred if d["date"] == today}
     expected = expected_latest_bar(now, market, cfg.data.interval)
-    fresh: dict[str, bool] = {}
-    for s, df in bars.items():
+    fresh: dict[str, bool | None] = {}  # None = 확인하지 못함 (수집 실패·조회 오류) → 다시 실행할 때 판단
+    for s in market.symbols:
+        if s in done or s not in bars:
+            fresh[s] = None if s not in bars else True
+            continue
+        df = bars[s]
         last_day = df.index[-1].date()
         if expected is not None and last_day == expected.date():
             fresh[s] = True
@@ -497,15 +523,21 @@ def _vts_order_phase(cfg, market, bars, sigs, state, bal, unmanaged, broker, rm,
         try:
             base = broker.quote(s)["base"]
         except KisError as e:
-            base = 0.0
-            notes.append(f"{market.label(s)}: 기준가 조회 실패 ({e})")
+            fresh[s] = None
+            notes.append(f"{market.label(s)}: 기준가 조회 실패 ({e}) → 이 종목은 다시 실행할 때 판단")
+            continue
         fresh[s] = base > 0 and abs(float(df["close"].iloc[-1]) / base - 1) < 0.001
         if not fresh[s]:
             notes.append(f"{market.label(s)}: 최신 일봉이 아닙니다 (마지막 {last_day}) → 오늘은 이 종목을 판단하지 않음")
+    complete = True
 
-    sold = set()
     for s, memo in list(state.positions.items()):
-        if s not in bars or not fresh.get(s):
+        if s in done:
+            continue
+        if fresh.get(s) is None:
+            complete = False
+            continue
+        if not fresh[s]:
             continue
         sig, close = sigs[s].iloc[-1], float(bars[s]["close"].iloc[-1])
         if rm.halted and rk.liquidate_on_halt:
@@ -521,68 +553,81 @@ def _vts_order_phase(cfg, market, bars, sigs, state, bal, unmanaged, broker, rm,
             notes.append(f"{market.label(s)}: 매도({REASONS.get(reason, reason)}) 보류 — 이전 매도 주문이 아직 걸려 있음")
             continue
         _submit(broker, state, events, market, today, "sell", s, qty, None, reason)
-        sold.add(s)
 
-    state.order_phase_date = today
     if rm.halted:
-        notes.append(f"매매 중단 상태: {rm.halt_reason} → 신규 매수 없음 (상태 파일의 risk.halted 를 사람이 직접 해제)")
-        return
-    slots = (st.max_positions - (len(state.positions) - len(sold))) if st.max_positions else len(bars)
-    cands = []
-    for s in market.symbols:
-        if s not in bars or not fresh.get(s) or s in state.positions or s in unmanaged:
-            continue
-        sig = sigs[s].iloc[-1]
-        if not bool(sig["entry"]) or _cooling(bars[s], state.last_exit.get(s), bars[s].index[-1], st.reentry_cooldown_bars):
-            continue
-        sc = float(sig["score"])
-        cands.append((sc if sc == sc else -np.inf, s))
-    cands.sort(key=lambda x: -x[0])
-    budget = rm.position_budget(bal.total_equity)
-    available = bal.cash
-    fee = market.costs.commission
-    for rank, (_, s) in enumerate(cands, start=1):
-        if rank > max(slots, 0):
-            notes.append(f"{market.label(s)}: 진입 신호지만 빈자리가 없음 (최대 {st.max_positions}종목)")
-            continue
-        ok, why = rm.can_enter(today)
-        if not ok:
-            notes.append(f"{market.label(s)}: 매수 보류 — {why}")
-            continue
-        close = float(bars[s]["close"].iloc[-1])
-        limit = buy_limit_price(close, st.entry_limit_pct) if st.entry_limit_pct > 0 else None
-        ref = limit if limit is not None else close
-        qty = int(budget // (ref * (1 + fee)))
-        if qty <= 0:
-            notes.append(f"{market.label(s)}: 1종목 예산 {budget:,.0f}원으로 1주도 살 수 없음")
-            continue
-        need = qty * ref * (1 + fee)
-        rm.record_entry(today)  # 주문 기준으로 하루 진입 횟수를 센다
-        if need <= available:
-            _submit(broker, state, events, market, today, "buy", s, qty, limit, "entry")
-            available -= need
-        else:
-            state.deferred.append({"date": today, "symbol": s, "qty": qty, "limit": limit, "reason": "entry"})
-            events.append(_event(today, "매수 대기", market, s, qty, limit, need, reason="entry", note="현금 부족 → 매도 체결 후 주문"))
+        notes.append(f"매매 중단 상태: {rm.halt_reason} → 신규 매수 없음 (원인을 확인한 뒤 trade --resume 으로 재개)")
+    else:
+        # 빈자리·현금은 오늘 이미 낸 주문까지 반영해서 센다. 거부된 매도는 자리를 비우지 않는다.
+        todays = [o for o in state.orders if o["date"] == today]
+        selling = {o["symbol"] for o in todays if o["side"] == "sell" and o["status"] in _LIVE} & set(state.positions)
+        buying = [o for o in todays if o["side"] == "buy" and o["status"] in _LIVE]
+        waiting = [d for d in state.deferred if d["date"] == today]
+        held_after = len(state.positions) - len(selling) + len(buying) + len(waiting)
+        slots = (st.max_positions - held_after) if st.max_positions else len(bars)
+        available = bal.cash - sum(o["qty"] * o.get("ref", o["limit"] or 0) * (1 + fee) for o in buying)
+        cands = []
+        for s in market.symbols:
+            if s in done or s in state.positions or s in unmanaged:
+                continue
+            if fresh.get(s) is None:
+                complete = False
+                continue
+            if not fresh[s]:
+                continue
+            sig = sigs[s].iloc[-1]
+            if not bool(sig["entry"]) or _cooling(bars[s], state.last_exit.get(s), bars[s].index[-1], st.reentry_cooldown_bars):
+                continue
+            sc = float(sig["score"])
+            cands.append((sc if sc == sc else -np.inf, s))
+        cands.sort(key=lambda x: -x[0])
+        budget = rm.position_budget(bal.total_equity)
+        for rank, (_, s) in enumerate(cands, start=1):
+            if rank > max(slots, 0):
+                notes.append(f"{market.label(s)}: 진입 신호지만 빈자리가 없음 (최대 {st.max_positions}종목)")
+                continue
+            ok, why = rm.can_enter(today)
+            if not ok:
+                notes.append(f"{market.label(s)}: 매수 보류 — {why}")
+                continue
+            close = float(bars[s]["close"].iloc[-1])
+            limit = buy_limit_price(close, st.entry_limit_pct) if st.entry_limit_pct > 0 else None
+            ref = limit if limit is not None else close
+            qty = int(budget // (ref * (1 + fee)))
+            if qty <= 0:
+                notes.append(f"{market.label(s)}: 1종목 예산 {budget:,.0f}원으로 1주도 살 수 없음")
+                continue
+            need = qty * ref * (1 + fee)
+            rm.record_entry(today)  # 주문 기준으로 하루 진입 횟수를 센다
+            if need <= available:
+                _submit(broker, state, events, market, today, "buy", s, qty, limit, "entry", ref=ref)
+                available -= need
+            else:
+                state.deferred.append({"date": today, "symbol": s, "qty": qty, "limit": limit, "reason": "entry"})
+                events.append(_event(today, "매수 대기", market, s, qty, limit, need, reason="entry", note="현금 부족 → 매도 체결 후 주문"))
+
+    if complete:
+        state.order_phase_date = today
+    else:
+        notes.append("일부 종목을 확인하지 못했습니다 → 09:00 전에 다시 실행하면 그 종목만 이어서 판단합니다 (이미 낸 주문은 다시 내지 않음)")
 
 
 def _vts_check_phase(cfg, market, state, broker, rm, now, events, notes) -> None:
-    rk = cfg.risk
+    st, rk = cfg.strategy, cfg.risk
     today = f"{now:%Y-%m-%d}"
     todays = [o for o in state.orders if o["date"] == today]
-    if state.order_phase_date != today and not todays:
+    if state.order_phase_date != today and not todays and not any(d["date"] == today for d in state.deferred):
         notes.append("오늘 주문 단계 기록이 없습니다 → 08:30~09:00 에 trade 를 먼저 실행해야 합니다")
         return
     open_orders = [o for o in todays if o["status"] in _OPEN_STATUSES]
     if open_orders:
         _apply_fills(broker.daily_orders(now.strftime("%Y%m%d")), open_orders, state, broker, market, rk, events, notes, cancel_rest=True)
-    # 동시호가에서 거부된 주문: 매도는 시장가로 한 번만 재시도, 매수는 대기 목록으로
+    # 동시호가에서 거부된 주문: 매도는 시장가로 한 번만 재시도, 매수는 대기 목록으로 (대기 후 낸 매수가 또 거부되면 끝)
     for o in [o for o in todays if o["status"] == "rejected"]:
         o["status"] = "retried"
         if o["side"] == "sell":
             if not o.get("retry"):
                 _submit(broker, state, events, market, today, "sell", o["symbol"], o["qty"], None, o["reason"], retry=True)
-        elif not o.get("deferred"):  # 대기 후 낸 매수가 또 거부되면 더 시도하지 않음
+        elif not o.get("deferred"):
             state.deferred.append({"date": today, "symbol": o["symbol"], "qty": o["qty"], "limit": o["limit"], "reason": o["reason"]})
 
     waiting = [d for d in state.deferred if d["date"] == today]
@@ -592,9 +637,13 @@ def _vts_check_phase(cfg, market, state, broker, rm, now, events, notes) -> None
         notes.append(f"매매 중단 상태 ({rm.halt_reason}) → 대기 매수 {len(waiting)}건을 내지 않고 버립니다")
         state.deferred = [d for d in state.deferred if d["date"] != today]
         return
-    if any(o["side"] == "sell" and o["status"] in _OPEN_STATUSES + ("rejected",) for o in state.orders if o["date"] == today):
+    todays = [o for o in state.orders if o["date"] == today]
+    if any(o["side"] == "sell" and o["status"] in _LIVE for o in todays):
         notes.append("매도 체결을 기다리는 중 → 대기 매수는 다음 확인 때 주문합니다")
         return
+    # 매도가 끝내 체결되지 않았으면 그 자리는 비지 않았다 → 남은 빈자리만큼만 산다
+    buying = sum(1 for o in todays if o["side"] == "buy" and o["status"] in _LIVE)
+    free = (st.max_positions - len(state.positions) - buying) if st.max_positions else len(waiting)
     available = broker.balance().cash
     fee = market.costs.commission
     keep = []
@@ -613,11 +662,15 @@ def _vts_check_phase(cfg, market, state, broker, rm, now, events, notes) -> None
         if d["limit"] is not None and q["open"] > d["limit"]:
             events.append(_event(today, "미체결", market, s, d["qty"], q["open"], reason=d["reason"], note=f"시가 {q['open']:,.0f} > 지정가 {d['limit']:,.0f} → 주문 안 함"))
             continue
+        if free <= 0:
+            events.append(_event(today, "매수 못함", market, s, d["qty"], d["limit"], reason=d["reason"], note="빈자리 없음 (매도가 체결되지 않음)"))
+            continue
         ref = d["limit"] if d["limit"] is not None else q["price"]
         qty = min(int(d["qty"]), int(available // (ref * (1 + fee))))
         if qty <= 0:
             events.append(_event(today, "매수 못함", market, s, d["qty"], ref, reason=d["reason"], note="매도 후에도 현금 부족"))
             continue
-        _submit(broker, state, events, market, today, "buy", s, qty, d["limit"], d["reason"], deferred=True)
+        _submit(broker, state, events, market, today, "buy", s, qty, d["limit"], d["reason"], deferred=True, ref=ref)
         available -= qty * ref * (1 + fee)
+        free -= 1
     state.deferred = [d for d in state.deferred if d["date"] != today] + keep
