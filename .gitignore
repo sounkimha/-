@@ -169,3 +169,8 @@ cython_debug/
 data_cache/
 state/
 reports/
+
+# 가상계좌 자동 운영 기록(paper/)은 추적한다. 모의투자 상태와 토큰은 어디에 있든 제외
+**/kis_token.json
+paper/*_vts_*
+paper/*.tmp

@@ -1,0 +1,37 @@
+{
+  "risk": {
+    "peak_equity": 1000000,
+    "halted": false,
+    "halt_reason": null,
+    "halted_at": null,
+    "daily_entries": {}
+  },
+  "last_date": "2026-10-01",
+  "cash": 1000000.0,
+  "positions": {},
+  "last_close": {
+    "069500.KS": 111520.0,
+    "229200.KS": 15315.0,
+    "091160.KS": 149700.0,
+    "091170.KS": 15700.0,
+    "091180.KS": 25455.0,
+    "102970.KS": 17620.0,
+    "305720.KS": 14665.0,
+    "117700.KS": 6740.0,
+    "244580.KS": 8485.0
+  },
+  "pending": [
+    {
+      "side": "buy",
+      "symbol": "091160.KS",
+      "reason": "entry",
+      "plan_date": "2026-10-01",
+      "budget": 330000.0,
+      "limit": 152694.0
+    }
+  ],
+  "last_exit": {},
+  "orders": [],
+  "deferred": [],
+  "order_phase_date": null
+}

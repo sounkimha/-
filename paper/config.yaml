@@ -1,0 +1,15 @@
+# =====================================================================
+#  가상계좌 자동 운영 — config.daily.yaml 의 규칙을 그대로 쓰고, 기록 위치만 이 폴더로 바꾼다.
+#    python main.py --config paper/config.yaml trade --market kr
+#    python main.py --config paper/config.yaml summary
+#  이 폴더의 상태·기록 파일은 운영 기록으로 git 에 남긴다. 비밀값(.env)·토큰은 두지 않는다 (.gitignore 로 차단).
+#  상대 경로는 이 파일이 있는 폴더(paper/) 기준이다.
+# =====================================================================
+base: ../config.daily.yaml
+
+data:
+  cache_dir: ../data_cache
+
+paths:
+  state_dir: .                       # paper/daily_kr_paper_state.json · _journal.csv · _equity.csv
+  reports_dir: ../reports

@@ -250,3 +250,31 @@ def test_rule_signals_flags_stale_daily_data(dcfg, monkeypatch):
         next_evening += pd.Timedelta(days=1)
     stale, _ = rule_signals(dcfg, "kr", now=next_evening)
     assert stale["stale"].all() and stale["비고"].str.contains("지연").all()
+
+
+def test_config_base_inheritance(tmp_path):
+    base = tmp_path / "base.yaml"
+    base.write_text((ROOT / "config.daily.yaml").read_text(encoding="utf-8").replace("cache_dir: data_cache", f"cache_dir: {ROOT / 'data_cache'}"), encoding="utf-8")
+    child_dir = tmp_path / "child"
+    child_dir.mkdir()
+    child = child_dir / "c.yaml"
+    child.write_text("base: ../base.yaml\nrisk:\n  max_drawdown_pct: 20.0\npaths:\n  state_dir: .\n", encoding="utf-8")
+    cfg = load_config(child)
+    assert cfg.risk.max_drawdown_pct == 20.0 and cfg.risk.stop_loss_pct == 8.0  # 겹쳐 쓴 키만 바뀜
+    assert cfg.strategy.type == "rule_breakout" and len(cfg.market("kr").symbols) == 9
+    assert cfg.path(cfg.paths.state_dir) == child_dir  # 상대 경로는 자식 파일 폴더 기준
+    loop = tmp_path / "loop.yaml"
+    loop.write_text("base: loop.yaml\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="순환"):
+        load_config(loop)
+    missing = tmp_path / "missing.yaml"
+    missing.write_text("base: nowhere.yaml\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="없습니다"):
+        load_config(missing)
+
+
+def test_paper_profile_uses_exactly_the_daily_rules():
+    daily, paper = load_config(ROOT / "config.daily.yaml"), load_config(ROOT / "paper" / "config.yaml")
+    assert (paper.strategy, paper.risk, paper.markets, paper.broker) == (daily.strategy, daily.risk, daily.markets, daily.broker)
+    assert paper.path(paper.paths.state_dir) == ROOT / "paper"
+    assert paper.path(paper.data.cache_dir).resolve() == ROOT / "data_cache"

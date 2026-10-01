@@ -285,12 +285,34 @@ def _validate(cfg: AppConfig) -> None:
         raise ConfigError("broker.overseas.order_type 은 limit 만 지원합니다 (모의투자 미국주식은 지정가만 가능)")
 
 
-def load_config(path: str | Path | None = None) -> AppConfig:
-    path = Path(path) if path else DEFAULT_CONFIG_PATH
+def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
+    """dict 는 키 단위로 겹쳐 쓰고, 그 밖의 값(숫자·문자열·리스트)은 통째로 바꾼다."""
+    out = dict(base)
+    for k, v in over.items():
+        out[k] = _merge(out[k], v) if isinstance(out.get(k), dict) and isinstance(v, dict) else v
+    return out
+
+
+def _read_yaml(path: Path, chain: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """설정 파일을 읽는다. `base: 다른파일.yaml` 이 있으면 그 파일을 먼저 읽고 이 파일 값으로 덮어쓴다."""
+    path = path.resolve()
+    if path in chain:
+        raise ConfigError(f"설정 base 가 순환합니다: {' → '.join(str(p) for p in chain + (path,))}")
     if not path.exists():
         raise ConfigError(f"설정 파일이 없습니다: {path}")
     with open(path, encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    base = raw.pop("base", None)
+    if base is None:
+        return raw
+    return _merge(_read_yaml(path.parent / str(base), chain + (path,)), raw)
+
+
+def load_config(path: str | Path | None = None) -> AppConfig:
+    path = Path(path) if path else DEFAULT_CONFIG_PATH
+    if not path.exists():
+        raise ConfigError(f"설정 파일이 없습니다: {path}")
+    raw = _read_yaml(path)  # 상대 경로(cache_dir·state_dir 등)는 이 파일이 있는 폴더 기준
 
     markets_raw = raw.get("markets") or {}
     if not markets_raw:

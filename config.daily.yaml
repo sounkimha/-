@@ -57,7 +57,7 @@ risk:
   stop_loss_pct: 8.0                 # 종가가 매수가 대비 -8% 이하 → 다음 날 시가 매도 (갭이면 더 잃음)
   stop_check: close                  # 장중 저가가 아니라 '종가'로 판단 (장중에 화면을 안 봐도 되게)
   position_size_pct: 33.0            # 1종목 = 평가금액의 33%. 100만원이면 약 33만원
-  max_drawdown_pct: 10.0             # 계좌 고점 대비 -10% → 전부 매도하고 매매 중단 (재개는 사람이 판단)
+  max_drawdown_pct: 10.0             # 계좌 고점 대비 -10% → 전부 매도하고 중단. '멈추고 점검' 체크포인트 (paper/README.md 정책, 재개는 trade --resume)
   liquidate_on_halt: true
   max_trades_per_day: 3
 

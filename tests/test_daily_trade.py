@@ -174,6 +174,22 @@ def test_paper_catches_up_missed_days_and_is_idempotent(paper):
     assert list(journal.columns) == dt.JOURNAL_COLUMNS and len(journal) == len(events_gap)
 
 
+def test_paper_summary_reports_performance_vs_benchmark(paper):
+    full, ctx, tmp_path = paper
+    cfg = small_cfg(tmp_path, max_drawdown_pct=40.0)
+    days = list(next(iter(full.values())).index[60:120])
+    events, reps = run_days(cfg, ctx, days)
+    rep = dt.paper_summary(cfg, "kr", full)
+    assert rep["start"] == f"{days[0]:%Y-%m-%d}" and rep["last"] == f"{days[-1]:%Y-%m-%d}" and rep["days"] == len(days) - 1
+    assert rep["equity"] == pytest.approx(reps[-1].equity) and rep["ret"] == pytest.approx(reps[-1].equity / 1_000_000 - 1)
+    assert rep["buys"] == sum(e["구분"] == "매수" for e in events) and rep["closed"] == sum(e["구분"] == "매도" for e in events)
+    bench = list(full)[0]
+    part = full[bench][(full[bench].index > days[0]) & (full[bench].index <= days[-1])]
+    expect = part["close"].iloc[-1] * (1 - 0.0002) * (1 - 0.00015) / (part["open"].iloc[0] * 1.0002 * 1.00015) - 1
+    assert rep["bench_ret"] == pytest.approx(expect, rel=1e-9)
+    assert rep["mdd"] <= 0 and set(rep["holdings"]) == set(dt.DailyState.load(dt.daily_files(cfg, "kr", True)["state"]).positions)
+
+
 def test_paper_first_run_only_plans_and_shows_order_sheet(paper):
     full, ctx, tmp_path = paper
     cfg = small_cfg(tmp_path, max_drawdown_pct=40.0)

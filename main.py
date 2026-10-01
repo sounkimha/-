@@ -11,6 +11,7 @@
   python main.py --config config.daily.yaml backtest
   python main.py --config config.daily.yaml signal --held 069500@105000 --equity 1000000
   python main.py --config config.daily.yaml trade --market kr   가상계좌 정산·계획 (DRY_RUN) / 모의투자 주문·확인
+  python main.py --config paper/config.yaml summary              가상계좌 자동 운영 기록 요약
 """
 from __future__ import annotations
 
@@ -362,6 +363,36 @@ def trade_rules(cfg, args) -> int:
     return 0
 
 
+def cmd_summary(cfg, args) -> int:
+    """일봉 가상계좌 운영 요약 (기록 파일 기준). 같은 기간 기준 ETF 보유와 비교."""
+    from trader.daily_trade import paper_summary
+
+    if cfg.strategy.type != "rule_breakout":
+        print("summary 는 일봉 규칙(rule_breakout) 가상계좌 전용입니다.")
+        return 2
+    bars, errors = load_market(cfg, args.market, offline=args.offline)
+    rep = paper_summary(cfg, args.market, bars)
+    if rep is None:
+        print("가상계좌 기록이 없습니다. 먼저 trade 를 실행하세요.")
+        return 1
+    m = rep["market"]
+    bench = "-" if rep["bench_ret"] is None else f"{rep['bench_ret']:+.2%}"
+    print(f"\n## {m.name} 가상계좌 요약 — {rep['start']} ~ {rep['last']} ({rep['days']}거래일 운영)")
+    print(
+        f"평가금액 {_won(rep['equity'])}{m.currency} ({rep['ret']:+.2%}) · 같은 기간 {rep['bench']} 보유 {bench}"
+        f" · 최대낙폭 {rep['mdd']:.2%} · 매매중단 {'예 — ' + str(rep['halt_reason']) if rep['halted'] else '아니오'}"
+    )
+    win = f"{rep['wins']}/{rep['closed']}" if rep["closed"] else "-"
+    print(
+        f"매수 {rep['buys']}건 · 청산 {rep['closed']}건 (이익 {win}, 실현손익 {_won(rep['realized'])}) · 지정가 미체결 {rep['unfilled']}건"
+    )
+    held = ", ".join(f"{m.label(s)} {q}주" for s, q in rep["holdings"].items()) or "없음"
+    plan = ", ".join(f"{'매수' if side == 'buy' else '매도'} {m.label(s)}" for side, s in rep["pending"]) or "없음"
+    print(f"보유: {held}\n다음 거래일 시가 주문: {plan}")
+    print_data_errors(errors)
+    return 0
+
+
 def cmd_trade(cfg, args) -> int:
     if cfg.strategy.type == "rule_breakout":
         return trade_rules(cfg, args)
@@ -442,6 +473,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ignore-hours", action="store_true", help="DRY_RUN 일 때만: 장 시간이 아니어도 가상계좌로 진행")
     s.add_argument("--resume", action="store_true", help="계좌 낙폭 한도로 멈춘 매매를 재개 (고점 기준을 지금 평가금액으로 다시 잡음)")
     s.set_defaults(func=cmd_trade)
+
+    s = sub.add_parser("summary", help="일봉 가상계좌 운영 요약 (같은 기간 기준 ETF 보유와 비교)")
+    s.add_argument("--market", default="kr", help="kr")
+    s.add_argument("--offline", action="store_true", help="네트워크 없이 캐시만 사용")
+    s.set_defaults(func=cmd_summary)
 
     s = sub.add_parser("broker-check", help="모의투자 토큰·잔고·시세 조회 (주문 없음)")
     s.add_argument("--market", default="all", help="kr | us | all")

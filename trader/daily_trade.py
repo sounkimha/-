@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .backtest import Account, Trade
+from .backtest import Account, Trade, buy_hold_curve, max_drawdown
 from .broker.domestic import to_krx_code
 from .broker.kis_client import KisError, to_float
 from .config import AppConfig, ConfigError, MarketConfig, is_dry_run, load_credentials, load_env
@@ -319,6 +319,52 @@ def _paper_cycle(cfg, market, bars, sigs, state, now, errors, files, notes) -> D
         cash=acct.cash, drawdown=rm.drawdown(equity), halted=rm.halted, halt_reason=rm.halt_reason,
         holdings=holdings, events=events, planned=planned, notes=notes, data_errors=errors, files=files,
     )
+
+
+def paper_summary(cfg: AppConfig, market_key: str, bars: dict[str, pd.DataFrame]) -> dict[str, Any] | None:
+    """가상계좌 기록으로 운영 기간 성과를 요약하고, 같은 기간 기준 ETF(설정의 첫 종목) 단순보유와 비교."""
+    market = cfg.market(market_key)
+    files = daily_files(cfg, market_key, True)
+    if not files["equity"].exists():
+        return None
+    eq = pd.read_csv(files["equity"], encoding="utf-8-sig")
+    journal = (
+        pd.read_csv(files["journal"], encoding="utf-8-sig") if files["journal"].exists() else pd.DataFrame(columns=JOURNAL_COLUMNS)
+    )
+    state = DailyState.load(files["state"])
+    init = market.initial_capital
+    start, last = str(eq["일자"].iloc[0]), str(eq["일자"].iloc[-1])
+    final = float(eq["평가금액"].iloc[-1])
+    bench = next(iter(market.symbols))
+    bench_ret = None
+    b = bars.get(bench)
+    if b is not None:  # 첫 체결이 가능한 날(시작 다음 거래일) 시가에 사서 마지막 처리일 종가까지
+        tz = b.index.tz
+        part = b[(b.index > pd.Timestamp(start).tz_localize(tz)) & (b.index <= pd.Timestamp(last).tz_localize(tz))]
+        if len(part):
+            bench_ret = float(buy_hold_curve(part, market.costs).iloc[-1] - 1)
+    sells = journal[journal["구분"] == "매도"]
+    pnl = pd.to_numeric(sells["손익"], errors="coerce")
+    return {
+        "market": market,
+        "start": start,
+        "last": last,
+        "days": len(eq) - 1,  # 첫 행은 시작일(계획만 함)
+        "equity": final,
+        "ret": final / init - 1,
+        "mdd": max_drawdown(pd.concat([pd.Series([init]), eq["평가금액"]], ignore_index=True)),
+        "bench": market.label(bench),
+        "bench_ret": bench_ret,
+        "buys": int((journal["구분"] == "매수").sum()),
+        "closed": len(sells),
+        "wins": int((pnl > 0).sum()),
+        "realized": float(pnl.sum()),
+        "unfilled": int((journal["구분"] == "미체결").sum()),
+        "halted": bool(state.risk.get("halted")),
+        "halt_reason": state.risk.get("halt_reason"),
+        "holdings": {s: int(t["qty"]) for s, t in state.positions.items()},
+        "pending": [(o["side"], o["symbol"]) for o in state.pending],
+    }
 
 
 # --------------------------------------------------------------------------
