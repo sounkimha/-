@@ -105,6 +105,8 @@ broker:
     domestic_sell: VTTC0011U
     domestic_balance: VTTC8434R
     domestic_price: FHKST01010100
+    domestic_cancel: VTTC0013U       # 주식주문(정정취소) — 일봉 프로필에서 사용
+    domestic_daily_ccld: VTTC0081R   # 주식일별주문체결조회 — 일봉 프로필에서 사용
     overseas_buy: VTTT1002U
     overseas_sell: VTTT1001U
     overseas_balance: VTTS3012R

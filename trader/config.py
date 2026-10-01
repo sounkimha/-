@@ -176,6 +176,8 @@ class TrIdConfig:
     domestic_sell: str = "VTTC0011U"
     domestic_balance: str = "VTTC8434R"
     domestic_price: str = "FHKST01010100"
+    domestic_cancel: str = "VTTC0013U"  # 주식주문(정정취소)
+    domestic_daily_ccld: str = "VTTC0081R"  # 주식일별주문체결조회 (3개월 이내)
     overseas_buy: str = "VTTT1002U"
     overseas_sell: str = "VTTT1001U"
     overseas_balance: str = "VTTS3012R"

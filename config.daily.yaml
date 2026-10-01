@@ -61,6 +61,20 @@ risk:
   liquidate_on_halt: true
   max_trades_per_day: 3
 
+broker:
+  # 한국투자증권 모의투자 — .env 에서 사람이 직접 DRY_RUN=false 로 바꿨을 때만 쓴다. 실전 서버·실전 tr_id 는 코드에서 거부.
+  min_request_interval_sec: 0.5
+  request_timeout_sec: 10
+  domestic:
+    exchange_id: KRX                 # 넥스트레이드·SOR 이 아니라 KRX 시가 동시호가로 보낸다
+  tr_id:                             # 공식 GitHub 예제 기준 모의투자 tr_id
+    domestic_buy: VTTC0012U
+    domestic_sell: VTTC0011U
+    domestic_cancel: VTTC0013U       # 주식주문(정정취소)
+    domestic_daily_ccld: VTTC0081R   # 주식일별주문체결조회
+    domestic_balance: VTTC8434R
+    domestic_price: FHKST01010100
+
 paths:
-  state_dir: state
+  state_dir: state                   # 가상계좌·모의투자 상태와 체결 기록 (git 제외)
   reports_dir: reports

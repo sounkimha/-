@@ -44,6 +44,28 @@ def make_bars(
     return pd.DataFrame(rows, index=pd.DatetimeIndex(idx, name="time"), columns=["open", "high", "low", "close", "volume"])
 
 
+def daily_bars(closes, opens=None, start="2025-01-06", lows=None, tz="Asia/Seoul") -> pd.DataFrame:
+    """영업일 00:00 인덱스의 일봉 (야후 일봉과 같은 모양). 시가를 안 주면 종가와 같게."""
+    days = pd.bdate_range(start, periods=len(closes))
+    idx = pd.DatetimeIndex([pd.Timestamp(d.date()).tz_localize(tz) for d in days], name="time")
+    c = np.asarray(closes, float)
+    o = c.copy() if opens is None else np.asarray(opens, float)
+    lo = np.minimum(o, c) if lows is None else np.asarray(lows, float)
+    return pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": lo, "close": c, "volume": 1000.0}, index=idx)
+
+
+def random_daily(n=160, seed=0, start="2024-01-01", drift=0.0008, vol=0.02, price=10_000.0) -> pd.DataFrame:
+    """갭이 있는 랜덤워크 일봉 (규칙 전략이 진입·청산을 여러 번 하도록)."""
+    rng = np.random.default_rng(seed)
+    close = price * np.cumprod(1 + rng.normal(drift, vol, n))
+    gap = rng.normal(0, vol * 0.4, n)
+    opens = np.r_[close[0], close[:-1] * (1 + gap[1:])]
+    df = daily_bars(close, opens, start=start)
+    df["high"] = df[["open", "close"]].max(axis=1) * (1 + np.abs(rng.normal(0, vol / 4, n)))
+    df["low"] = df[["open", "close"]].min(axis=1) * (1 - np.abs(rng.normal(0, vol / 4, n)))
+    return df
+
+
 def bars_from_rows(rows, tz="Asia/Seoul") -> pd.DataFrame:
     """[(시각 문자열, o, h, l, c), ...] → OHLCV."""
     idx = pd.DatetimeIndex([pd.Timestamp(r[0]).tz_localize(tz) for r in rows], name="time")

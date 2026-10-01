@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 import trader.daily as daily
-from conftest import ROOT
+from conftest import ROOT, daily_bars
 from trader.backtest import comparison_table, run_backtest, with_cost_multiplier
 from trader.config import ConfigError, StrategyConfig, load_config
 from trader.daily import Held, buy_limit_price, next_weekday, parse_held, plan_orders, rule_signals
@@ -20,16 +20,6 @@ SMALL = replace(StrategyConfig(), type="rule_breakout", long_ma=5, breakout_look
 @pytest.fixture
 def dcfg():
     return load_config(ROOT / "config.daily.yaml")
-
-
-def daily_bars(closes, opens=None, start="2025-01-06", lows=None) -> pd.DataFrame:
-    """영업일 00:00(KST) 인덱스의 일봉 (야후 일봉과 같은 모양)."""
-    days = pd.bdate_range(start, periods=len(closes))
-    idx = pd.DatetimeIndex([pd.Timestamp(d.date()).tz_localize(KST) for d in days], name="time")
-    c = np.asarray(closes, float)
-    o = c.copy() if opens is None else np.asarray(opens, float)
-    lo = np.minimum(o, c) if lows is None else np.asarray(lows, float)
-    return pd.DataFrame({"open": o, "high": np.maximum(o, c), "low": lo, "close": c, "volume": 1000.0}, index=idx)
 
 
 def signals(df, entry, hold=True, score=0.0) -> pd.DataFrame:

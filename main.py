@@ -10,6 +10,7 @@
   일봉 ETF 프로필 (config.daily.yaml, strategy.type=rule_breakout):
   python main.py --config config.daily.yaml backtest
   python main.py --config config.daily.yaml signal --held 069500@105000 --equity 1000000
+  python main.py --config config.daily.yaml trade --market kr   가상계좌 정산·계획 (DRY_RUN) / 모의투자 주문·확인
 """
 from __future__ import annotations
 
@@ -323,13 +324,47 @@ def signal_rules(cfg, args) -> int:
     return code
 
 
+def trade_rules(cfg, args) -> int:
+    """일봉 규칙: DRY_RUN 이면 가상계좌 정산·계획, 아니면 모의투자 주문/확인 단계."""
+    from trader.daily_trade import run_daily_cycle
+
+    rep = run_daily_cycle(cfg, args.market, offline=args.offline)
+    m = rep.market
+    mode = "DRY_RUN — 가상계좌 (주문 전송 안 함)" if rep.dry_run else "모의투자 서버로 주문 전송"
+    print(f"\n## {m.name} 매매 사이클 — {rep.now:%Y-%m-%d %H:%M %Z} · 모드: {mode} · 단계: {rep.phase}")
+    print(
+        f"기준 일봉 {rep.base_date or '-'} · 평가금액 {_won(rep.equity)}{m.currency} · 현금 {_won(rep.cash)}"
+        f" · 고점 대비 {rep.drawdown:+.2%} · 매매중단 {'예 — ' + str(rep.halt_reason) if rep.halted else '아니오'}"
+    )
+    for note in rep.notes:
+        print(f"  - {note}")
+    print("\n[이번 실행에서 처리한 것]")
+    print(table(pd.DataFrame(rep.events), ",.0f") if rep.events else "없음")
+    print("\n[보유]")
+    if rep.holdings:
+        h = pd.DataFrame(rep.holdings)
+        for col in ("매수가", "최근가", "손절가"):
+            h[col] = h[col].map(_won)
+        h["평가손익%"] = h["평가손익%"].map(lambda v: "-" if v is None or pd.isna(v) else f"{v:+.1f}")
+        print(table(h))
+    else:
+        print("없음")
+    if rep.dry_run:
+        print("\n[다음 거래일 시가 주문] (실계좌를 가상계좌와 똑같이 운용하려면 MTS 에 같은 주문을 넣으세요)")
+    else:
+        print("\n[오늘 주문]")
+    print(table(pd.DataFrame(rep.planned), ",.0f") if rep.planned else "없음")
+    extra = f" · 일별 평가: {rep.files['equity']}" if rep.dry_run else ""
+    print(f"\n상태: {rep.files['state']} · 체결 기록: {rep.files['journal']}{extra}")
+    if args.ignore_hours:
+        print("참고: --ignore-hours 는 일봉 모드에서 쓰지 않습니다 (가상계좌는 완성된 일봉 기준, 모의투자는 시계 기준)")
+    print_data_errors(rep.data_errors)
+    return 0
+
+
 def cmd_trade(cfg, args) -> int:
     if cfg.strategy.type == "rule_breakout":
-        print(
-            "rule_breakout(일봉)은 아직 trade(자동 주문)를 지원하지 않습니다. signal 의 주문표를 보고 직접 주문하세요.\n"
-            "다음 단계: 한국투자증권 모의투자로 시가 지정가 주문 자동화 (README 로드맵)"
-        )
-        return 2
+        return trade_rules(cfg, args)
     from trader.live import run_trade_cycle
 
     rep = run_trade_cycle(cfg, args.market, offline=args.offline, ignore_hours=args.ignore_hours)

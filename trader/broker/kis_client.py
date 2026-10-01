@@ -112,6 +112,7 @@ class OrderResult:
     dry_run: bool
     ok: bool
     order_no: str | None = None
+    org_no: str | None = None  # 한국거래소전송주문조직번호 (취소 주문에 필요)
     message: str = ""
     uncertain: bool = False  # 전송했지만 응답을 못 받음 → 접수 여부 불명 (다음 사이클에 잔고로 확인)
     raw: dict[str, Any] | None = field(default=None, repr=False)
@@ -260,6 +261,25 @@ class KisClient:
         """조회(시세·잔고) 전용 GET. 주문이 아니므로 DRY_RUN 과 무관하지만, 자격정보가 있어야 한다."""
         return self._check(self._request("GET", path, headers=self._headers(tr_id), params=params))
 
+    def get_all(
+        self, path: str, tr_id: str, params: dict[str, str], key: str = "output1", max_pages: int = 10
+    ) -> list[dict[str, Any]]:
+        """연속조회(tr_cont M/F)가 있는 목록 조회. 모의투자는 한 번에 15건까지 내려준다."""
+        params, rows, tr_cont = dict(params), [], ""
+        for _ in range(max_pages):
+            headers = self._headers(tr_id)
+            headers["tr_cont"] = tr_cont
+            resp = self._request("GET", path, headers=headers, params=params)
+            data = self._check(resp)
+            rows.extend(data.get(key) or [])
+            if resp.headers.get("tr_cont") not in ("M", "F"):
+                return rows
+            params["CTX_AREA_FK100"] = data.get("ctx_area_fk100", "")
+            params["CTX_AREA_NK100"] = data.get("ctx_area_nk100", "")
+            tr_cont = "N"
+        log.warning("%s: 연속조회 %d쪽에서 멈춤 (뒤의 내역은 읽지 않음)", path, max_pages)
+        return rows
+
     def submit_order(self, req: OrderRequest) -> OrderResult:
         """주문 전송의 유일한 통로. 여기서 DRY_RUN·tr_id 를 검사한다."""
         if not req.tr_id.startswith("V"):
@@ -286,4 +306,7 @@ class KisClient:
             return OrderResult(req, sent=True, dry_run=False, ok=False, message=str(e))
         out = data.get("output") or {}
         order_no = out.get("ODNO") or out.get("odno")
-        return OrderResult(req, sent=True, dry_run=False, ok=True, order_no=order_no, message=data.get("msg1", ""), raw=data)
+        org_no = out.get("KRX_FWDG_ORD_ORGNO") or out.get("krx_fwdg_ord_orgno")
+        return OrderResult(
+            req, sent=True, dry_run=False, ok=True, order_no=order_no, org_no=org_no, message=data.get("msg1", ""), raw=data
+        )
