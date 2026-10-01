@@ -1,0 +1,116 @@
+# =====================================================================
+#  국장·미장 1시간봉 단타 자동매매 설정
+#  - 숫자로 된 모든 값(종목, 비용, 손실 제한, 모델, 전략)은 여기서 수정한다.
+#  - API 키·시크릿·계좌번호·DRY_RUN 은 이 파일이 아니라 .env 에만 둔다.
+#  - 시각 문자열("09:00")은 반드시 따옴표로 감쌀 것 (YAML이 15:30 을 숫자로 읽음).
+# =====================================================================
+
+markets:
+  kr:
+    name: 국내주식
+    currency: KRW
+    timezone: Asia/Seoul
+    initial_capital: 10000000        # 백테스트 / DRY_RUN 가상계좌 시작 금액(원)
+    data_delay_minutes: 20           # (추정) 야후 KRX 시세 지연. 완성되지 않은 봉을 버리는 데 사용
+    session:
+      open: "09:00"
+      close: "15:30"
+    symbols:                         # yfinance 티커: 표시 이름
+      "005930.KS": 삼성전자
+      "000660.KS": SK하이닉스
+      "035420.KS": NAVER
+    costs:                           # 단위: %
+      commission_pct: 0.015          # 편도 수수료 (매수·매도 각각)
+      sell_tax_pct: 0.20             # 매도 시 거래세. 2026년~: 코스피 0.05%+농특세 0.15%, 코스닥 0.20%
+      slippage_pct: 0.01             # 편도 슬리피지
+      # 왕복 = 0.015*2 + 0.20 + 0.01*2 = 0.25%
+
+  us:
+    name: 미국주식
+    currency: USD
+    timezone: America/New_York
+    initial_capital: 10000           # 달러
+    data_delay_minutes: 0
+    session:
+      open: "09:30"
+      close: "16:00"
+    symbols:
+      AAPL: Apple
+      NVDA: NVIDIA
+      MSFT: Microsoft
+    costs:
+      commission_pct: 0.04
+      sell_tax_pct: 0.0              # SEC fee 등은 매우 작아 0. 환전 스프레드는 미포함
+      slippage_pct: 0.01
+      # 왕복 = 0.04*2 + 0 + 0.01*2 = 0.10%
+
+data:
+  interval: 1h
+  period_days: 729                   # yfinance 1시간봉은 최근 730일까지만 제공
+  cache_dir: data_cache
+  cache_max_age_minutes: 30          # 캐시가 이보다 오래됐으면 새로 받음
+
+features:
+  return_windows: [1, 2, 4, 8, 24]   # 기간별 수익률 (봉 개수)
+  rsi_period: 14
+  ma_windows: [5, 20, 60]            # 이동평균 비율 (첫 값과 마지막 값으로 골든/데드 비율도 계산)
+  volatility_windows: [8, 24]
+  volume_window: 20
+  range_window: 24                   # 최근 N봉 고가/저가 대비 위치
+
+model:
+  type: hgb                          # hgb(HistGradientBoosting) | logistic | random_forest
+  pooled: true                       # true: 같은 시장 종목을 합쳐 하나의 모델 / false: 종목별 모델
+  min_train_days: 180                # 첫 학습에 쓰는 최소 거래일 수 (이 기간은 예측·매매 안 함)
+  retrain_every_days: 5              # 몇 거래일마다 재학습할지 (워크포워드 한 구간 길이)
+  train_window_days: 0               # 0 = 확장 윈도우(과거 전부), N = 최근 N거래일만
+  random_state: 42
+  params:
+    hgb: {max_depth: 3, learning_rate: 0.05, max_iter: 200, min_samples_leaf: 100, l2_regularization: 1.0, early_stopping: false}
+    logistic: {C: 0.1, max_iter: 2000}
+    random_forest: {n_estimators: 300, max_depth: 5, min_samples_leaf: 100, n_jobs: -1}
+
+strategy:
+  entry_threshold: 0.50              # 상승확률(다음 봉이 왕복비용 이상 오를 확률)이 이 값 이상이면 매수 후보
+  min_expected_return_pct: 0.0       # 그리고 비용 차감 기대수익(%)이 이 값 이상일 때만 매수
+  exit_threshold: 0.45               # 보유 중 상승확률이 이 값 미만이면 다음 봉 시가에 청산
+  max_hold_bars: 0                   # 최대 보유 봉 수 (0 = 제한 없음)
+  flatten_at_session_end: true       # 마지막 봉 시가에 전량 청산 + 마지막 봉 신규 진입 금지 (오버나이트 안 함)
+
+risk:                                # 손실을 0으로 만들 수는 없다. 아래는 '제한' 장치다.
+  stop_loss_pct: 1.0                 # 1회 손절: 진입가 대비 -1%
+  position_size_pct: 20.0            # 1회 투입: 계좌 평가금액의 20%
+  max_drawdown_pct: 10.0             # 계좌 고점 대비 -10% 도달 → 전체 매매 중단
+  liquidate_on_halt: true            # 매매 중단 시 보유 포지션도 청산
+  max_trades_per_day: 4              # 하루 최대 신규 진입 횟수 (시장별 계좌 기준, 청산·손절 매도는 제한 없음)
+
+broker:
+  # 한국투자증권 Open API — 모의투자 전용. 실전 도메인과 실전 tr_id 는 코드에서 거부한다.
+  # DRY_RUN 은 .env 에서 설정 (없으면 true). true 면 주문을 만들어 로그만 남기고 전송하지 않는다.
+  min_request_interval_sec: 0.5      # 모의투자 호출 간격 (공식 예제 기준)
+  request_timeout_sec: 10
+  domestic:
+    exchange_id: KRX                 # EXCG_ID_DVSN_CD
+    order_type: market               # market(01 시장가) | limit(00 지정가 = 현재가 ± 버퍼, 호가단위 맞춤)
+    limit_buffer_pct: 0.3
+  overseas:
+    order_type: limit                # 모의투자 미국주식은 지정가(00)만 가능
+    limit_buffer_pct: 0.3            # 현재가 ± 버퍼로 '즉시 체결될 만한' 지정가를 냄
+    exchanges:                       # yfinance 티커: 주문용 거래소코드(NASD/NYSE/AMEX)
+      AAPL: NASD
+      NVDA: NASD
+      MSFT: NASD
+  tr_id:                             # 모의투자 tr_id (공식 GitHub 확인값. 바뀌면 여기만 수정)
+    domestic_buy: VTTC0012U
+    domestic_sell: VTTC0011U
+    domestic_balance: VTTC8434R
+    domestic_price: FHKST01010100
+    overseas_buy: VTTT1002U
+    overseas_sell: VTTT1001U
+    overseas_balance: VTTS3012R
+    overseas_buying_power: VTTS3007R
+    overseas_price: HHDFS00000300
+
+paths:
+  state_dir: state                   # 토큰 캐시, 리스크 상태, DRY_RUN 가상계좌 (git 제외)
+  reports_dir: reports               # 백테스트 결과 CSV (git 제외)
