@@ -493,6 +493,8 @@ def test_vts_outside_windows_only_reads(vts):
     cfg, fake, bars, *_ = vts
     rep = dt.run_daily_cycle(cfg, "kr", now=kst("2025-03-10 16:00"))
     assert rep.phase == "조회" and fake.placed == [] and fake.cancels == []
-    assert dt.vts_phase(kst("2025-03-08 08:35")) == "조회"  # 토요일
-    assert dt.vts_phase(kst("2025-03-10 08:29")) == "조회" and dt.vts_phase(kst("2025-03-10 15:20")) == "조회"
-    assert dt.vts_phase(kst("2025-03-10 09:00")) == "조회" and dt.vts_phase(kst("2025-03-10 09:02")) == "확인"  # 체결 반영 대기
+    kr = cfg.market("kr")
+    assert dt.vts_phase(kst("2025-03-08 08:35"), kr) == "조회"  # 토요일
+    assert dt.vts_phase(kst("2025-03-10 08:29"), kr) == "조회" and dt.vts_phase(kst("2025-03-10 15:20"), kr) == "조회"
+    assert dt.vts_phase(kst("2025-03-10 09:00"), kr) == "조회" and dt.vts_phase(kst("2025-03-10 09:02"), kr) == "확인"  # 체결 반영 대기
+    assert dt.vts_phase(kst("2026-10-05 08:35"), kr) == "조회" and dt.vts_phase(kst("2026-10-06 08:35"), kr) == "주문"  # 휴장일

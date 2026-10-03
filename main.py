@@ -240,7 +240,7 @@ def _ox(flag: bool) -> str:
 
 def signal_rules(cfg, args) -> int:
     """일봉 규칙: 종목별 상태 + 다음 거래일 시가 주문표 (주문은 보내지 않음)."""
-    from trader.daily import next_weekday, parse_held, plan_orders, rule_signals
+    from trader.daily import next_trading_day, parse_held, plan_orders, rule_signals
 
     st, rk = cfg.strategy, cfg.risk
     code = 0
@@ -255,8 +255,9 @@ def signal_rules(cfg, args) -> int:
             code = 2
             continue
         base = max(sig["기준일"])
-        order_day = next_weekday(base)
-        print(f"\n## {market.name} — {base} 종가 기준 → {order_day} 시가 주문 (주말만 건너뜀 · 공휴일 미반영)")
+        order_day = next_trading_day(base, market)
+        cal = "KRX 휴장일 반영" if market.calendar == "KRX" else "주말만 건너뜀 · 공휴일 미반영"
+        print(f"\n## {market.name} — {base} 종가 기준 → {order_day} 시가 주문 ({cal})")
         now = pd.Timestamp.now(tz=market.timezone)
         if (now.date(), now.time()) >= (order_day, market.session.open):
             print(f"  ! 지금({now:%m-%d %H:%M})은 이 주문표의 시가({order_day} 09:00)가 이미 지났습니다. 장 마감 후 다시 실행하세요.")

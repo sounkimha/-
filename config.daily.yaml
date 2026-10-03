@@ -15,6 +15,7 @@ markets:
     name: 국내 ETF(일봉)
     currency: KRW
     timezone: Asia/Seoul
+    calendar: KRX                    # 거래소 휴장일 반영 (trader/krx_calendar.py, 2027년은 잠정)
     initial_capital: 1000000         # 100만원
     data_delay_minutes: 30           # 장 마감(15:30) 후 30분 지나야 그날 일봉을 완성 봉으로 본다
     session:

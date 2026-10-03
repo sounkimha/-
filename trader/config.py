@@ -88,6 +88,7 @@ class MarketConfig:
     session: SessionConfig
     symbols: dict[str, str]  # yfinance 티커 -> 표시 이름
     costs: CostConfig
+    calendar: str | None = None  # KRX: 한국거래소 휴장일 반영 / 없으면 주말만 쉼
 
     def label(self, ticker: str) -> str:
         return f"{self.symbols.get(ticker, ticker)}({ticker})"
@@ -279,6 +280,8 @@ def _validate(cfg: AppConfig) -> None:
             raise ConfigError(f"markets.{mk.key}.initial_capital 은 0보다 커야 합니다")
         if mk.session.open >= mk.session.close:
             raise ConfigError(f"markets.{mk.key}.session 시작 시각이 종료 시각보다 늦습니다")
+        if mk.calendar not in (None, "KRX"):
+            raise ConfigError(f"markets.{mk.key}.calendar 는 KRX 만 지원합니다 (없으면 주말만 쉼)")
     if cfg.broker.domestic.order_type not in {"market", "limit"}:
         raise ConfigError("broker.domestic.order_type 은 market | limit")
     if cfg.broker.overseas.order_type != "limit":

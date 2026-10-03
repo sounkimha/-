@@ -30,7 +30,7 @@ from .broker.domestic import to_krx_code
 from .broker.kis_client import KisError, to_float
 from .config import AppConfig, ConfigError, MarketConfig, is_dry_run, load_credentials, load_env
 from .daily import buy_limit_price
-from .data import DataError, expected_latest_bar, load_market
+from .data import DataError, expected_latest_bar, is_session_day, load_market
 from .risk import RiskManager, resume_state
 from .rules import trend_breakout
 
@@ -370,8 +370,8 @@ def paper_summary(cfg: AppConfig, market_key: str, bars: dict[str, pd.DataFrame]
 # --------------------------------------------------------------------------
 # DRY_RUN=false: 한국투자증권 모의투자
 # --------------------------------------------------------------------------
-def vts_phase(now: pd.Timestamp) -> str:
-    if now.weekday() >= 5:
+def vts_phase(now: pd.Timestamp, market: MarketConfig) -> str:
+    if not is_session_day(now, market):  # 주말·거래소 휴장일
         return "조회"
     t = now.time()
     if ORDER_START <= t < ORDER_END:
@@ -472,7 +472,7 @@ def _vts_cycle(cfg, market, bars, sigs, state, now, errors, files, notes) -> Dai
     broker = make_broker(cfg, market.key, creds, dry_run=False)
     rk = cfg.risk
     today = f"{now:%Y-%m-%d}"
-    phase = vts_phase(now)
+    phase = vts_phase(now, market)
     events: list[dict] = []
     rm = RiskManager.from_state(rk, state.risk, None)  # 낙폭 기준은 첫 잔고 조회값에서 시작
     bal = None
@@ -515,7 +515,8 @@ def _vts_cycle(cfg, market, bars, sigs, state, now, errors, files, notes) -> Dai
         elif phase == "확인":
             _vts_check_phase(cfg, market, state, broker, rm, now, events, notes)
         else:
-            notes.append("주문(평일 08:30~09:00)·확인(09:02~15:20) 시간이 아닙니다 → 조회만 했습니다")
+            closed = "" if is_session_day(now, market) else " (휴장일)"
+            notes.append(f"주문(거래일 08:30~09:00)·확인(09:02~15:20) 시간이 아닙니다{closed} → 조회만 했습니다")
     finally:
         state.risk = rm.to_state()
         state.save()

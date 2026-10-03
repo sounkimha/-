@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import AppConfig, DataConfig, MarketConfig
+from .krx_calendar import is_krx_trading_day
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ def _utcnow() -> pd.Timestamp:  # 테스트에서 시각을 바꿔 끼우기 위
 
 
 # --------------------------------------------------------------------------
-# 장 시간 (공휴일·조기폐장은 반영하지 않음: 주말만 건너뜀)
+# 장 시간 (market.calendar=KRX 면 거래소 휴장일까지 건너뜀, 아니면 주말만. 조기폐장은 반영하지 않음)
 # 날짜+현지 시각으로 직접 만들어 서머타임 전환일에도 어긋나지 않게 한다.
 # --------------------------------------------------------------------------
 def _local_date(ts: pd.Timestamp | date, market: MarketConfig) -> date:
@@ -37,6 +38,13 @@ def _local_date(ts: pd.Timestamp | date, market: MarketConfig) -> date:
 
 def _at(day: pd.Timestamp | date, hhmm: time, market: MarketConfig) -> pd.Timestamp:
     return pd.Timestamp(datetime.combine(_local_date(day, market), hhmm)).tz_localize(market.timezone)
+
+
+def is_session_day(day: pd.Timestamp | date, market: MarketConfig) -> bool:
+    d = _local_date(day, market)
+    if market.calendar == "KRX":
+        return is_krx_trading_day(d)
+    return d.weekday() < 5
 
 
 def session_close(ts: pd.Timestamp, market: MarketConfig) -> pd.Timestamp:
@@ -76,14 +84,14 @@ def next_bar_start(ts: pd.Timestamp, market: MarketConfig, interval: str = "1h")
     if nxt < session_close(ts, market):
         return nxt
     day = _local_date(ts, market) + timedelta(days=1)
-    while day.weekday() >= 5:
+    while not is_session_day(day, market):
         day += timedelta(days=1)
     return _at(day, market.session.open, market)
 
 
 def is_market_open(now: pd.Timestamp, market: MarketConfig) -> bool:
     now = now.tz_convert(market.timezone)
-    if now.weekday() >= 5:
+    if not is_session_day(now, market):
         return False
     return _at(now, market.session.open, market) <= now < _at(now, market.session.close, market)
 
@@ -91,7 +99,7 @@ def is_market_open(now: pd.Timestamp, market: MarketConfig) -> bool:
 def in_last_bar(now: pd.Timestamp, market: MarketConfig, interval: str = "1h") -> bool:
     """시계 기준: 지금이 그날 마지막 봉 구간(마지막 봉 시작 ~ 장 마감)인지. 데이터가 늦어도 판단 가능."""
     now = now.tz_convert(market.timezone)
-    starts = session_bar_starts(now, market, interval) if now.weekday() < 5 else []
+    starts = session_bar_starts(now, market, interval) if is_session_day(now, market) else []
     return bool(starts) and starts[-1] <= now < session_close(now, market)
 
 
@@ -101,7 +109,7 @@ def expected_latest_bar(now: pd.Timestamp, market: MarketConfig, interval: str =
     delay = pd.Timedelta(minutes=market.data_delay_minutes)
     day = now.date()
     for _ in range(14):
-        if day.weekday() < 5:
+        if is_session_day(day, market):
             for start in reversed(session_bar_starts(day, market, interval)):
                 if bar_end(start, market, interval) + delay <= now:
                     return start

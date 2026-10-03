@@ -10,6 +10,7 @@ markets:
     name: 국내주식
     currency: KRW
     timezone: Asia/Seoul
+    calendar: KRX                    # 거래소 휴장일 반영 (trader/krx_calendar.py, 2027년은 잠정)
     initial_capital: 10000000        # 백테스트 / DRY_RUN 가상계좌 시작 금액(원)
     data_delay_minutes: 20           # (추정) 야후 KRX 시세 지연. 완성되지 않은 봉을 버리는 데 사용
     session:                         # 실제 장 마감은 15:30 이지만, 야후 1시간봉은 14:00봉(~15:00)이 마지막이고

@@ -9,7 +9,7 @@ import trader.daily as daily
 from conftest import ROOT, daily_bars
 from trader.backtest import comparison_table, run_backtest, with_cost_multiplier
 from trader.config import ConfigError, StrategyConfig, load_config
-from trader.daily import Held, buy_limit_price, next_weekday, parse_held, plan_orders, rule_signals
+from trader.daily import Held, buy_limit_price, next_trading_day, parse_held, plan_orders, rule_signals
 from trader.data import bar_end, drop_incomplete_last_bar, expected_latest_bar, filter_session
 from trader.rules import first_valid_time, trend_breakout
 
@@ -160,7 +160,7 @@ def test_daily_bar_timing(dcfg):
     assert expected_latest_bar(pd.Timestamp("2025-03-10 08:00", tz=KST), kr, "1d").date().day == 7  # 월 아침 → 금
     saturday = df.iloc[[-1]].set_axis(pd.DatetimeIndex([pd.Timestamp("2025-03-08", tz=KST)], name="time"))
     assert len(filter_session(pd.concat([df, saturday]), kr, "1d")) == 2  # 토요일 봉 제거
-    assert next_weekday(pd.Timestamp("2025-03-07").date()).day == 10
+    assert next_trading_day(pd.Timestamp("2025-03-07").date(), kr) == pd.Timestamp("2025-03-10").date()
 
 
 def test_daily_config_loads_and_guards(dcfg, tmp_path):
@@ -278,3 +278,24 @@ def test_paper_profile_uses_exactly_the_daily_rules():
     assert (paper.strategy, paper.risk, paper.markets, paper.broker) == (daily.strategy, daily.risk, daily.markets, daily.broker)
     assert paper.path(paper.paths.state_dir) == ROOT / "paper"
     assert paper.path(paper.data.cache_dir).resolve() == ROOT / "data_cache"
+
+
+def test_krx_holidays_are_skipped(dcfg):
+    from datetime import date
+
+    from trader.data import is_market_open, next_bar_start
+    from trader.krx_calendar import KRX_HOLIDAYS, is_krx_trading_day, next_krx_trading_day
+
+    kr = dcfg.market("kr")
+    assert kr.calendar == "KRX"
+    assert not is_krx_trading_day(date(2026, 10, 5)) and is_krx_trading_day(date(2026, 10, 6))  # 개천절 대체공휴일
+    assert next_trading_day(date(2026, 10, 2), kr) == date(2026, 10, 6)
+    assert next_trading_day(date(2026, 10, 8), kr) == date(2026, 10, 12)  # 한글날
+    assert next_krx_trading_day(date(2026, 12, 30)) == date(2027, 1, 4)  # 연말 휴장·신정·주말
+    assert next_trading_day(date(2026, 10, 8), replace(kr, calendar=None)) == date(2026, 10, 9)  # 달력 없으면 주말만
+    assert len([d for d in KRX_HOLIDAYS if d.year == 2025]) == 19 and len([d for d in KRX_HOLIDAYS if d.year == 2026]) == 17
+    # 일봉: 휴장일 다음 날 아침에 기대하는 최신 일봉은 휴장일 전 거래일
+    assert expected_latest_bar(pd.Timestamp("2026-10-06 08:00", tz=KST), kr, "1d").date() == date(2026, 10, 2)
+    assert not is_market_open(pd.Timestamp("2026-10-05 10:00", tz=KST), kr)
+    hourly = load_config(ROOT / "config.yaml").market("kr")
+    assert next_bar_start(pd.Timestamp("2026-10-02 14:00", tz=KST), hourly) == pd.Timestamp("2026-10-06 09:00", tz=KST)

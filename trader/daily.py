@@ -17,7 +17,7 @@ import pandas as pd
 
 from .broker.domestic import krx_tick_size
 from .config import AppConfig, ConfigError, CostConfig, MarketConfig, RiskConfig, StrategyConfig
-from .data import DataError, expected_latest_bar, load_market
+from .data import DataError, expected_latest_bar, is_session_day, load_market
 from .rules import trend_breakout
 
 
@@ -55,9 +55,10 @@ def parse_held(items: list[str], market: MarketConfig) -> list[Held]:
     return out
 
 
-def next_weekday(d: date) -> date:
+def next_trading_day(d: date, market: MarketConfig) -> date:
+    """다음 거래일 (calendar=KRX 면 휴장일 건너뜀, 아니면 주말만)."""
     d += timedelta(days=1)
-    while d.weekday() >= 5:
+    while not is_session_day(d, market):
         d += timedelta(days=1)
     return d
 
